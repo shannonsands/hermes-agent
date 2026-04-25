@@ -569,6 +569,12 @@ DEFAULT_CONFIG = {
 
     },
 
+    # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
+    # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
+    "prompt_caching": {
+        "cache_ttl": "5m",
+    },
+
     # AWS Bedrock provider configuration.
     # Only used when model.provider is "bedrock".
     "bedrock": {
@@ -647,14 +653,6 @@ DEFAULT_CONFIG = {
             "extra_body": {},
         },
         "mcp": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 30,
-            "extra_body": {},
-        },
-        "flush_memories": {
             "provider": "auto",
             "model": "",
             "base_url": "",
@@ -825,6 +823,15 @@ DEFAULT_CONFIG = {
         # warning log if out of range.
         "max_spawn_depth": 1,        # depth cap (1 = flat [default], 2 = orchestrator→leaf, 3 = three-level)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
+        # When a subagent hits a dangerous-command approval prompt, the parent's
+        # prompt_toolkit TUI owns stdin — a thread-local input() call from the
+        # subagent worker would deadlock the parent UI. To avoid the deadlock,
+        # subagent threads ALWAYS resolve approvals non-interactively:
+        #   false (default) → auto-deny with a logger.warning audit line (safe)
+        #   true             → auto-approve "once" with a logger.warning audit line
+        # Flip to true only if you trust delegated work to run dangerous cmds
+        # without human review (cron pipelines, batch automation, etc.).
+        "subagent_auto_approve": False,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -881,7 +888,7 @@ DEFAULT_CONFIG = {
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
-        # discord_server tool: restrict which actions the agent may call.
+        # discord / discord_admin tools: restrict which actions the agent may call.
         # Default (empty) = all actions allowed (subject to bot privileged intents).
         # Accepts comma-separated string ("list_guilds,list_channels,fetch_messages")
         # or YAML list. Unknown names are dropped with a warning at load time.

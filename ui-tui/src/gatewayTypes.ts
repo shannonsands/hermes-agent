@@ -55,11 +55,13 @@ export interface ConfigDisplayConfig {
   bell_on_complete?: boolean
   details_mode?: string
   inline_diffs?: boolean
+  sections?: Record<string, string>
   show_cost?: boolean
   show_reasoning?: boolean
   streaming?: boolean
   thinking_mode?: string
   tui_compact?: boolean
+  tui_mouse?: boolean
   tui_statusbar?: 'bottom' | 'off' | 'on' | 'top' | boolean
 }
 
@@ -92,7 +94,7 @@ export interface SetupStatusResponse {
 // ── Session lifecycle ────────────────────────────────────────────────
 
 export interface SessionCreateResponse {
-  info?: SessionInfo & { credential_warning?: string }
+  info?: SessionInfo & { config_warning?: string; credential_warning?: string }
   session_id: string
 }
 

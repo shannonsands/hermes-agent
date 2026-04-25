@@ -148,7 +148,102 @@ def _detect_macos_system_proxy() -> str | None:
     return None
 
 
-def resolve_proxy_url(platform_env_var: str | None = None) -> str | None:
+def _split_host_port(value: str) -> tuple[str, int | None]:
+    raw = str(value or "").strip()
+    if not raw:
+        return "", None
+    if "://" in raw:
+        parsed = urlsplit(raw)
+        return (parsed.hostname or "").lower().rstrip("."), parsed.port
+    if raw.startswith("[") and "]" in raw:
+        host, _, rest = raw[1:].partition("]")
+        port = None
+        if rest.startswith(":") and rest[1:].isdigit():
+            port = int(rest[1:])
+        return host.lower().rstrip("."), port
+    if raw.count(":") == 1:
+        host, _, maybe_port = raw.rpartition(":")
+        if maybe_port.isdigit():
+            return host.lower().rstrip("."), int(maybe_port)
+    return raw.lower().strip("[]").rstrip("."), None
+
+
+def _no_proxy_entries() -> list[str]:
+    entries: list[str] = []
+    for key in ("NO_PROXY", "no_proxy"):
+        raw = os.environ.get(key, "")
+        entries.extend(part.strip() for part in raw.split(",") if part.strip())
+    return entries
+
+
+def _no_proxy_entry_matches(entry: str, host: str, port: int | None = None) -> bool:
+    token = str(entry or "").strip().lower()
+    if not token:
+        return False
+    if token == "*":
+        return True
+
+    token_host, token_port = _split_host_port(token)
+    if token_port is not None and port is not None and token_port != port:
+        return False
+    if token_port is not None and port is None:
+        return False
+    if not token_host:
+        return False
+
+    try:
+        network = ipaddress.ip_network(token_host, strict=False)
+        try:
+            return ipaddress.ip_address(host) in network
+        except ValueError:
+            return False
+    except ValueError:
+        pass
+
+    try:
+        token_ip = ipaddress.ip_address(token_host)
+        try:
+            return ipaddress.ip_address(host) == token_ip
+        except ValueError:
+            return False
+    except ValueError:
+        pass
+
+    if token_host.startswith("*."):
+        suffix = token_host[1:]
+        return host.endswith(suffix)
+    if token_host.startswith("."):
+        return host == token_host[1:] or host.endswith(token_host)
+    return host == token_host or host.endswith(f".{token_host}")
+
+
+def should_bypass_proxy(target_hosts: str | list[str] | tuple[str, ...] | set[str] | None) -> bool:
+    """Return True when NO_PROXY/no_proxy matches at least one target host.
+
+    Supports exact hosts, domain suffixes, wildcard suffixes, IP literals,
+    CIDR ranges, optional host:port entries, and ``*``.
+    """
+    entries = _no_proxy_entries()
+    if not entries or not target_hosts:
+        return False
+    if isinstance(target_hosts, str):
+        candidates = [target_hosts]
+    else:
+        candidates = list(target_hosts)
+    for candidate in candidates:
+        host, port = _split_host_port(str(candidate))
+        if not host:
+            continue
+        if any(_no_proxy_entry_matches(entry, host, port) for entry in entries):
+            return True
+    return False
+
+
+def resolve_proxy_url(
+    platform_env_var: str | None = None,
+    *,
+    target_hosts: str | list[str] | tuple[str, ...] | set[str] | None = None,
+) -> str | None:
     """Return a proxy URL from env vars, or macOS system proxy.
 
     Check order:
@@ -156,18 +251,26 @@ def resolve_proxy_url(platform_env_var: str | None = None) -> str | None:
       1. HTTPS_PROXY / HTTP_PROXY / ALL_PROXY (and lowercase variants)
       2. macOS system proxy via ``scutil --proxy`` (auto-detect)
 
-    Returns *None* if no proxy is found.
+    Returns *None* if no proxy is found, or if NO_PROXY/no_proxy matches one
+    of ``target_hosts``.
     """
     if platform_env_var:
         value = (os.environ.get(platform_env_var) or "").strip()
         if value:
+            if should_bypass_proxy(target_hosts):
+                return None
             return normalize_proxy_url(value)
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
                 "https_proxy", "http_proxy", "all_proxy"):
         value = (os.environ.get(key) or "").strip()
         if value:
+            if should_bypass_proxy(target_hosts):
+                return None
             return normalize_proxy_url(value)
-    return normalize_proxy_url(_detect_macos_system_proxy())
+    detected = normalize_proxy_url(_detect_macos_system_proxy())
+    if detected and should_bypass_proxy(target_hosts):
+        return None
+    return detected
 
 
 def proxy_kwargs_for_bot(proxy_url: str | None) -> dict:
@@ -2440,6 +2543,9 @@ class BasePlatformAdapter(ABC):
         user_id_alt: Optional[str] = None,
         chat_id_alt: Optional[str] = None,
         is_bot: bool = False,
+        guild_id: Optional[str] = None,
+        parent_chat_id: Optional[str] = None,
+        message_id: Optional[str] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
         # Normalize empty topic to None
@@ -2457,6 +2563,9 @@ class BasePlatformAdapter(ABC):
             user_id_alt=user_id_alt,
             chat_id_alt=chat_id_alt,
             is_bot=is_bot,
+            guild_id=str(guild_id) if guild_id else None,
+            parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
+            message_id=str(message_id) if message_id else None,
         )
     
     @abstractmethod

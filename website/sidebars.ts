@@ -81,7 +81,7 @@ const sidebars: SidebarsConfig = {
           label: 'Management',
           items: [
             'user-guide/features/web-dashboard',
-            'user-guide/features/dashboard-plugins',
+            'user-guide/features/extending-the-dashboard',
           ],
         },
         {
@@ -89,6 +89,7 @@ const sidebars: SidebarsConfig = {
           label: 'Advanced',
           items: [
             'user-guide/features/rl-training',
+            'user-guide/features/spotify',
           ],
         },
         {
@@ -215,6 +216,7 @@ const sidebars: SidebarsConfig = {
                 'user-guide/skills/bundled/media/media-gif-search',
                 'user-guide/skills/bundled/media/media-heartmula',
                 'user-guide/skills/bundled/media/media-songsee',
+                'user-guide/skills/bundled/media/media-spotify',
                 'user-guide/skills/bundled/media/media-youtube-content',
               ],
             },

@@ -685,6 +685,66 @@ class TestInit:
             assert a.api_mode == "anthropic_messages"
             assert a._use_prompt_caching is True
 
+    def test_prompt_caching_cache_ttl_defaults_without_config(self):
+        """cache_ttl stays 5m when prompt_caching is absent from config."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("hermes_cli.config.load_config", return_value={}),
+        ):
+            a = AIAgent(
+                api_key="test-k...7890",
+                model="anthropic/claude-sonnet-4-20250514",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a._cache_ttl == "5m"
+
+    def test_prompt_caching_cache_ttl_custom_1h(self):
+        """prompt_caching.cache_ttl 1h is applied when present in config."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"prompt_caching": {"cache_ttl": "1h"}},
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-k...7890",
+                model="anthropic/claude-sonnet-4-20250514",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a._cache_ttl == "1h"
+
+    def test_prompt_caching_cache_ttl_invalid_falls_back(self):
+        """Non-Anthropic TTL values keep default 5m without raising."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"prompt_caching": {"cache_ttl": "30m"}},
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-k...7890",
+                model="anthropic/claude-sonnet-4-20250514",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a._cache_ttl == "5m"
+
     def test_valid_tool_names_populated(self):
         """valid_tool_names should contain names from loaded tools."""
         tools = _make_tool_defs("web_search", "terminal")
@@ -3016,48 +3076,6 @@ class TestRetryExhaustion:
         assert "error" in result
         assert "UnboundLocalError" not in result.get("error", "")
         assert "bad messages" in result["error"]
-
-
-# ---------------------------------------------------------------------------
-# Flush sentinel leak
-# ---------------------------------------------------------------------------
-
-
-class TestFlushSentinelNotLeaked:
-    """_flush_sentinel must be stripped before sending messages to the API."""
-
-    def test_flush_sentinel_stripped_from_api_messages(self, agent_with_memory_tool):
-        """Verify _flush_sentinel is not sent to the API provider."""
-        agent = agent_with_memory_tool
-        agent._memory_store = MagicMock()
-        agent._memory_flush_min_turns = 1
-        agent._user_turn_count = 10
-        agent._cached_system_prompt = "system"
-
-        messages = [
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": "hi"},
-            {"role": "user", "content": "remember this"},
-        ]
-
-        # Mock the API to return a simple response (no tool calls)
-        mock_msg = SimpleNamespace(content="OK", tool_calls=None)
-        mock_choice = SimpleNamespace(message=mock_msg)
-        mock_response = SimpleNamespace(choices=[mock_choice])
-        agent.client.chat.completions.create.return_value = mock_response
-
-        # Bypass auxiliary client so flush uses agent.client directly
-        with patch("agent.auxiliary_client.call_llm", side_effect=RuntimeError("no provider")):
-            agent.flush_memories(messages, min_turns=0)
-
-        # Check what was actually sent to the API
-        call_args = agent.client.chat.completions.create.call_args
-        assert call_args is not None, "flush_memories never called the API"
-        api_messages = call_args.kwargs.get("messages") or call_args[1].get("messages")
-        for msg in api_messages:
-            assert "_flush_sentinel" not in msg, (
-                f"_flush_sentinel leaked to API in message: {msg}"
-            )
 
 
 # ---------------------------------------------------------------------------

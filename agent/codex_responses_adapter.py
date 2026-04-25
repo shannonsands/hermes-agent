@@ -23,26 +23,52 @@ from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 logger = logging.getLogger(__name__)
 
 
+# Matches Codex/Harmony tool-call serialization that occasionally leaks into
+# assistant-message content when the model fails to emit a structured
+# ``function_call`` item.  Accepts the common forms:
+#
+#   to=functions.exec_command
+#   assistant to=functions.exec_command
+#   <|channel|>commentary to=functions.exec_command
+#
+# ``to=functions.<name>`` is the stable marker — the optional ``assistant`` or
+# Harmony channel prefix varies by degeneration mode.  Case-insensitive to
+# cover lowercase/uppercase ``assistant`` variants.
+_TOOL_CALL_LEAK_PATTERN = re.compile(
+    r"(?:^|[\s>|])to=functions\.[A-Za-z_][\w.]*",
+    re.IGNORECASE,
+)
+
+
 # ---------------------------------------------------------------------------
 # Multimodal content helpers
 # ---------------------------------------------------------------------------
 
-def _chat_content_to_responses_parts(content: Any) -> List[Dict[str, Any]]:
+def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> List[Dict[str, Any]]:
     """Convert chat-style multimodal content to Responses API input parts.
 
     Input:  ``[{"type":"text"|"image_url", ...}]`` (native OpenAI Chat format)
-    Output: ``[{"type":"input_text"|"input_image", ...}]`` (Responses format)
+    Output: ``[{"type":"input_text"|"output_text"|"input_image", ...}]`` (Responses format)
+
+    The ``role`` parameter controls the text content type:
+    - ``"user"`` (default) → ``"input_text"``
+    - ``"assistant"`` → ``"output_text"``
+
+    The Responses API rejects ``input_text`` inside assistant messages and
+    ``output_text`` inside user messages, so callers MUST pass the correct
+    role for the message being converted.
 
     Returns an empty list when ``content`` is not a list or contains no
     recognized parts — callers fall back to the string path.
     """
+    text_type = "output_text" if role == "assistant" else "input_text"
     if not isinstance(content, list):
         return []
     converted: List[Dict[str, Any]] = []
     for part in content:
         if isinstance(part, str):
             if part:
-                converted.append({"type": "input_text", "text": part})
+                converted.append({"type": text_type, "text": part})
             continue
         if not isinstance(part, dict):
             continue
@@ -50,7 +76,7 @@ def _chat_content_to_responses_parts(content: Any) -> List[Dict[str, Any]]:
         if ptype in {"text", "input_text", "output_text"}:
             text = part.get("text")
             if isinstance(text, str) and text:
-                converted.append({"type": "input_text", "text": text})
+                converted.append({"type": text_type, "text": text})
             continue
         if ptype in {"image_url", "input_image"}:
             image_ref = part.get("image_url")
@@ -216,9 +242,10 @@ def _chat_messages_to_responses_input(messages: List[Dict[str, Any]]) -> List[Di
         if role in {"user", "assistant"}:
             content = msg.get("content", "")
             if isinstance(content, list):
-                content_parts = _chat_content_to_responses_parts(content)
+                content_parts = _chat_content_to_responses_parts(content, role=role)
+                text_type = "output_text" if role == "assistant" else "input_text"
                 content_text = "".join(
-                    p.get("text", "") for p in content_parts if p.get("type") == "input_text"
+                    p.get("text", "") for p in content_parts if p.get("type") == text_type
                 )
             else:
                 content_parts = []
@@ -412,13 +439,16 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                 content = ""
             if isinstance(content, list):
                 # Multimodal content from ``_chat_messages_to_responses_input``
-                # is already in Responses format (``input_text`` / ``input_image``).
-                # Validate each part and pass through.
+                # is already in Responses format (``input_text`` / ``output_text``
+                # / ``input_image``).  Validate each part and pass through.
+                # Use the correct text type for the role — ``output_text`` for
+                # assistant messages, ``input_text`` for user messages.
+                text_type = "output_text" if role == "assistant" else "input_text"
                 validated: List[Dict[str, Any]] = []
                 for part_idx, part in enumerate(content):
                     if isinstance(part, str):
                         if part:
-                            validated.append({"type": "input_text", "text": part})
+                            validated.append({"type": text_type, "text": part})
                         continue
                     if not isinstance(part, dict):
                         raise ValueError(
@@ -429,7 +459,7 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                         text = part.get("text", "")
                         if not isinstance(text, str):
                             text = str(text or "")
-                        validated.append({"type": "input_text", "text": text})
+                        validated.append({"type": text_type, "text": text})
                     elif ptype in {"input_image", "image_url"}:
                         image_ref = part.get("image_url", "")
                         detail = part.get("detail")
@@ -787,6 +817,37 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
         if isinstance(out_text, str):
             final_text = out_text.strip()
 
+    # ── Tool-call leak recovery ──────────────────────────────────
+    # gpt-5.x on the Codex Responses API sometimes degenerates and emits
+    # what should be a structured `function_call` item as plain assistant
+    # text using the Harmony/Codex serialization (``to=functions.foo
+    # {json}`` or ``assistant to=functions.foo {json}``). The model
+    # intended to call a tool, but the intent never made it into
+    # ``response.output`` as a ``function_call`` item, so ``tool_calls``
+    # is empty here. If we pass this through, the parent sees a
+    # confident-looking summary with no audit trail (empty ``tool_trace``)
+    # and no tools actually ran — the Taiwan-embassy-email incident.
+    #
+    # Detection: leaked tokens always contain ``to=functions.<name>`` and
+    # the assistant message has no real tool calls. Treat it as incomplete
+    # so the existing Codex-incomplete continuation path (3 retries,
+    # handled in run_agent.py) gets a chance to re-elicit a proper
+    # ``function_call`` item. The existing loop already handles message
+    # append, dedup, and retry budget.
+    leaked_tool_call_text = False
+    if final_text and not tool_calls and _TOOL_CALL_LEAK_PATTERN.search(final_text):
+        leaked_tool_call_text = True
+        logger.warning(
+            "Codex response contains leaked tool-call text in assistant content "
+            "(no structured function_call items). Treating as incomplete so the "
+            "continuation path can re-elicit a proper tool call. Leaked snippet: %r",
+            final_text[:300],
+        )
+        # Clear the text so downstream code doesn't surface the garbage as
+        # a summary. The encrypted reasoning items (if any) are preserved
+        # so the model keeps its chain-of-thought on the retry.
+        final_text = ""
+
     assistant_message = SimpleNamespace(
         content=final_text,
         tool_calls=tool_calls,
@@ -798,6 +859,8 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
 
     if tool_calls:
         finish_reason = "tool_calls"
+    elif leaked_tool_call_text:
+        finish_reason = "incomplete"
     elif has_incomplete_items or (saw_commentary_phase and not saw_final_answer_phase):
         finish_reason = "incomplete"
     elif reasoning_items_raw and not final_text:

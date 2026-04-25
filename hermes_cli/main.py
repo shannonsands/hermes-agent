@@ -166,6 +166,27 @@ from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
+# Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
+# var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
+# module-import time). Without this, config.yaml's toggle is ignored because
+# the setup_logging() call below imports agent.redact, which reads the env var
+# exactly once. Env var in .env still wins — this is config.yaml fallback only.
+try:
+    if "HERMES_REDACT_SECRETS" not in os.environ:
+        import yaml as _yaml_early
+        _cfg_path = get_hermes_home() / "config.yaml"
+        if _cfg_path.exists():
+            with open(_cfg_path, encoding="utf-8") as _f:
+                _early_sec_cfg = (_yaml_early.safe_load(_f) or {}).get("security", {})
+            if isinstance(_early_sec_cfg, dict):
+                _early_redact = _early_sec_cfg.get("redact_secrets")
+                if _early_redact is not None:
+                    os.environ["HERMES_REDACT_SECRETS"] = str(_early_redact).lower()
+            del _early_sec_cfg
+        del _cfg_path
+except Exception:
+    pass  # best-effort — redaction stays at default (enabled) on config errors
+
 # Initialize centralized file logging early — all `hermes` subcommands
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
 try:
@@ -818,6 +839,8 @@ def _find_bundled_tui(tui_dir: Path) -> Optional[Path]:
 
 
 def _tui_build_needed(tui_dir: Path) -> bool:
+    if _hermes_ink_bundle_stale(tui_dir):
+        return True
     entry = tui_dir / "dist" / "entry.js"
     if not entry.exists():
         return True
@@ -1005,7 +1028,12 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     return [node, str(root / "dist" / "entry.js")], root
 
 
-def _launch_tui(resume_session_id: Optional[str] = None, tui_dev: bool = False):
+def _launch_tui(
+    resume_session_id: Optional[str] = None,
+    tui_dev: bool = False,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+):
     """Replace current process with the TUI."""
     tui_dir = PROJECT_ROOT / "ui-tui"
 
@@ -1015,6 +1043,12 @@ def _launch_tui(resume_session_id: Optional[str] = None, tui_dev: bool = False):
     )
     env.setdefault("HERMES_PYTHON", sys.executable)
     env.setdefault("HERMES_CWD", os.getcwd())
+    if model:
+        env["HERMES_MODEL"] = model
+        env["HERMES_INFERENCE_MODEL"] = model
+    if provider:
+        env["HERMES_TUI_PROVIDER"] = provider
+        env["HERMES_INFERENCE_PROVIDER"] = provider
     # Guarantee an 8GB V8 heap + exposed GC for the TUI. Default node cap is
     # ~1.5–4GB depending on version and can fatal-OOM on long sessions with
     # large transcripts / reasoning blobs. Token-level merge: respect any
@@ -1164,6 +1198,8 @@ def cmd_chat(args):
         _launch_tui(
             getattr(args, "resume", None),
             tui_dev=getattr(args, "tui_dev", False),
+            model=getattr(args, "model", None),
+            provider=getattr(args, "provider", None),
         )
 
     # Import and run the CLI
@@ -1440,6 +1476,7 @@ def select_provider_and_model(args=None):
         load_config,
         get_env_value,
     )
+    from hermes_cli.providers import resolve_provider_full
 
     config = load_config()
     current_model = config.get("model")
@@ -1457,14 +1494,30 @@ def select_provider_and_model(args=None):
     effective_provider = (
         config_provider or os.getenv("HERMES_INFERENCE_PROVIDER") or "auto"
     )
-    try:
-        active = resolve_provider(effective_provider)
-    except AuthError as exc:
-        warning = format_auth_error(exc)
-        print(f"Warning: {warning} Falling back to auto provider detection.")
+    compatible_custom_providers = get_compatible_custom_providers(config)
+    active = None
+    if effective_provider != "auto":
+        active_def = resolve_provider_full(
+            effective_provider,
+            config.get("providers"),
+            compatible_custom_providers,
+        )
+        if active_def is not None:
+            active = active_def.id
+        else:
+            warning = (
+                f"Unknown provider '{effective_provider}'. Check 'hermes model' for "
+                "available providers, or run 'hermes doctor' to diagnose config "
+                "issues."
+            )
+            print(f"Warning: {warning} Falling back to auto provider detection.")
+    if active is None:
         try:
             active = resolve_provider("auto")
-        except AuthError:
+        except AuthError as exc:
+            if effective_provider == "auto":
+                warning = format_auth_error(exc)
+                print(f"Warning: {warning} Falling back to auto provider detection.")
             active = None  # no provider yet; default to first in list
 
     # Detect custom endpoint
@@ -1680,7 +1733,6 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("session_search",   "Session search",   "past-conversation recall"),
     ("approval",         "Approval",         "smart command approval"),
     ("mcp",              "MCP",              "MCP tool reasoning"),
-    ("flush_memories",   "Flush memories",   "memory consolidation"),
     ("title_generation", "Title generation", "session titles"),
     ("skills_hub",       "Skills hub",       "skills search/install"),
 ]
@@ -2322,7 +2374,41 @@ def _model_flow_openai_codex(config, current_model=""):
     from hermes_cli.codex_models import get_codex_model_ids
 
     status = get_codex_auth_status()
-    if not status.get("logged_in"):
+    if status.get("logged_in"):
+        print("  OpenAI Codex credentials: ✓")
+        print()
+        print("    1. Use existing credentials")
+        print("    2. Reauthenticate (new OAuth login)")
+        print("    3. Cancel")
+        print()
+        try:
+            choice = input("  Choice [1/2/3]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            choice = "1"
+
+        if choice == "2":
+            print("Starting a fresh OpenAI Codex login...")
+            print()
+            try:
+                mock_args = argparse.Namespace()
+                _login_openai_codex(
+                    mock_args,
+                    PROVIDER_REGISTRY["openai-codex"],
+                    force_new_login=True,
+                )
+            except SystemExit:
+                print("Login cancelled or failed.")
+                return
+            except Exception as exc:
+                print(f"Login failed: {exc}")
+                return
+            status = get_codex_auth_status()
+            if not status.get("logged_in"):
+                print("Login failed.")
+                return
+        elif choice == "3":
+            return
+    else:
         print("Not logged into OpenAI Codex. Starting login...")
         print()
         try:
@@ -2839,10 +2925,15 @@ def _model_flow_named_custom(config, provider_info):
 
     name = provider_info["name"]
     base_url = provider_info["base_url"]
+    api_mode = provider_info.get("api_mode", "")
     api_key = provider_info.get("api_key", "")
     key_env = provider_info.get("key_env", "")
     saved_model = provider_info.get("model", "")
     provider_key = (provider_info.get("provider_key") or "").strip()
+
+    # Resolve key from env var if api_key not set directly
+    if not api_key and key_env:
+        api_key = os.environ.get(key_env, "")
 
     print(f"  Provider: {name}")
     print(f"  URL:      {base_url}")
@@ -2851,7 +2942,10 @@ def _model_flow_named_custom(config, provider_info):
     print()
 
     print("Fetching available models...")
-    models = fetch_api_models(api_key, base_url, timeout=8.0)
+    models = fetch_api_models(
+        api_key, base_url, timeout=8.0,
+        api_mode=api_mode or None,
+    )
 
     if models:
         default_idx = 0
@@ -3941,11 +4035,70 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
                 print("Cancelled.")
                 return
             save_env_value(key_env, new_key)
+            existing_key = new_key
             print("API key saved.")
             print()
     else:
         print(f"  {pconfig.name} API key: {existing_key[:8]}... ✓")
         print()
+
+    # Gemini free-tier gate: free-tier daily quotas (<= 250 RPD for Flash)
+    # are exhausted in a handful of agent turns, so refuse to wire up the
+    # provider with a free-tier key. Probe is best-effort; network or auth
+    # errors fall through without blocking.
+    if provider_id == "gemini" and existing_key:
+        try:
+            from agent.gemini_native_adapter import probe_gemini_tier
+        except Exception:
+            probe_gemini_tier = None
+        if probe_gemini_tier is not None:
+            print("  Checking Gemini API tier...")
+            probe_base = (
+                (get_env_value(base_url_env) if base_url_env else "")
+                or os.getenv(base_url_env or "", "")
+                or pconfig.inference_base_url
+            )
+            tier = probe_gemini_tier(existing_key, probe_base)
+            if tier == "free":
+                print()
+                print(
+                    "❌ This Google API key is on the free tier "
+                    "(<= 250 requests/day for gemini-2.5-flash)."
+                )
+                print(
+                    "   Hermes typically makes 3-10 API calls per user turn "
+                    "(tool iterations + auxiliary tasks),"
+                )
+                print(
+                    "   so the free tier is exhausted after a handful of "
+                    "messages and cannot sustain"
+                )
+                print("   an agent session.")
+                print()
+                print(
+                    "   To use Gemini with Hermes, enable billing on your "
+                    "Google Cloud project and regenerate"
+                )
+                print(
+                    "   the key in a billing-enabled project: "
+                    "https://aistudio.google.com/apikey"
+                )
+                print()
+                print(
+                    "   Alternatives with workable free usage: DeepSeek, "
+                    "OpenRouter (free models), Groq, Nous."
+                )
+                print()
+                print("Not saving Gemini as the default provider.")
+                return
+            if tier == "paid":
+                print("  Tier check: paid ✓")
+            else:
+                # "unknown" -- network issue, auth problem, unexpected response.
+                # Don't block; the runtime 429 handler will surface free-tier
+                # guidance if the key turns out to be free tier.
+                print("  Tier check: could not verify (proceeding anyway).")
+            print()
 
     # Optional base URL override
     current_base = ""
@@ -4188,6 +4341,8 @@ def _model_flow_anthropic(config, current_model=""):
         from agent.anthropic_adapter import (
             read_claude_code_credentials,
             is_claude_code_token_valid,
+            _is_oauth_token,
+            _resolve_claude_code_token_from_credentials,
         )
 
         cc_creds = read_claude_code_credentials()
@@ -4196,7 +4351,14 @@ def _model_flow_anthropic(config, current_model=""):
     except Exception:
         pass
 
-    has_creds = bool(existing_key) or cc_available
+    # Stale-OAuth guard: if the only existing cred is an expired OAuth token
+    # (no valid cc_creds to fall back on), treat it as missing so the re-auth
+    # path is offered instead of silently accepting a broken token.
+    existing_is_stale_oauth = False
+    if existing_key and _is_oauth_token(existing_key) and not cc_available:
+        existing_is_stale_oauth = True
+
+    has_creds = (bool(existing_key) and not existing_is_stale_oauth) or cc_available
     needs_auth = not has_creds
 
     if has_creds:
@@ -5909,6 +6071,75 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             import signal as _signal
 
+            def _wait_for_service_active(
+                scope_cmd_: list, svc_name_: str, timeout: float = 10.0,
+            ) -> bool:
+                """Poll ``systemctl is-active`` until the unit reports active.
+
+                systemd's Stopped -> Started transition after a graceful exit
+                (or a hard restart) is not instantaneous; a one-shot check
+                races that window and falsely reports the unit as down.
+                Poll every 0.5s up to ``timeout`` seconds before giving up.
+                """
+                deadline = _time.monotonic() + max(timeout, 0.5)
+                while True:
+                    try:
+                        _verify = subprocess.run(
+                            scope_cmd_ + ["is-active", svc_name_],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if _verify.stdout.strip() == "active":
+                            return True
+                    except (FileNotFoundError, subprocess.TimeoutExpired):
+                        pass
+                    if _time.monotonic() >= deadline:
+                        return False
+                    _time.sleep(0.5)
+
+            def _service_restart_sec(
+                scope_cmd_: list, svc_name_: str, default: float = 0.0,
+            ) -> float:
+                """Read the unit's ``RestartUSec`` (RestartSec) in seconds.
+
+                After a graceful exit-75, systemd waits ``RestartSec`` before
+                respawning the unit.  Callers that poll for ``is-active``
+                must use a timeout >= ``RestartSec`` + transition slack, or
+                they'll give up *during* the cooldown window and wrongly
+                conclude the unit didn't relaunch.
+                """
+                try:
+                    _show = subprocess.run(
+                        scope_cmd_ + [
+                            "show", svc_name_,
+                            "--property=RestartUSec", "--value",
+                        ],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    return default
+                raw = (_show.stdout or "").strip()
+                # systemd emits values like "30s", "100ms", "1min 30s", or
+                # "infinity".  Parse conservatively; on any miss return default.
+                if not raw or raw == "infinity":
+                    return default
+                total = 0.0
+                matched = False
+                for part in raw.split():
+                    for _suf, _mult in (
+                        ("ms", 0.001),
+                        ("us", 0.000001),
+                        ("min", 60.0),
+                        ("s", 1.0),
+                    ):
+                        if part.endswith(_suf):
+                            try:
+                                total += float(part[: -len(_suf)]) * _mult
+                                matched = True
+                            except ValueError:
+                                pass
+                            break
+                return total if matched else default
+
             # Drain budget for graceful SIGUSR1 restarts.  The gateway drains
             # for up to ``agent.restart_drain_timeout`` (default 60s) before
             # exiting with code 75; we wait slightly longer so the drain
@@ -6015,14 +6246,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
                             if _graceful_ok:
                                 # Gateway exited 75; systemd should relaunch
-                                # via Restart=on-failure.  Verify the new
-                                # process came up.
-                                _time.sleep(3)
-                                verify = subprocess.run(
-                                    scope_cmd + ["is-active", svc_name],
-                                    capture_output=True, text=True, timeout=5,
+                                # via Restart=on-failure.  The unit's
+                                # RestartSec (default 30s on ours) gates the
+                                # respawn — poll past that + slack so we
+                                # don't give up mid-cooldown and falsely
+                                # print "drained but didn't relaunch".  For
+                                # units without RestartSec set we fall back
+                                # to the original 10s budget.
+                                _restart_sec = _service_restart_sec(
+                                    scope_cmd, svc_name, default=0.0,
                                 )
-                                if verify.stdout.strip() == "active":
+                                _post_drain_timeout = max(
+                                    10.0, _restart_sec + 10.0,
+                                )
+                                if _wait_for_service_active(
+                                    scope_cmd, svc_name,
+                                    timeout=_post_drain_timeout,
+                                ):
                                     restarted_services.append(svc_name)
                                     continue
                                 # Process exited but wasn't respawned (older
@@ -6048,14 +6288,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 # Verify the service actually survived the
                                 # restart.  systemctl restart returns 0 even
                                 # if the new process crashes immediately.
-                                _time.sleep(3)
-                                verify = subprocess.run(
-                                    scope_cmd + ["is-active", svc_name],
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=5,
-                                )
-                                if verify.stdout.strip() == "active":
+                                if _wait_for_service_active(
+                                    scope_cmd, svc_name, timeout=10.0,
+                                ):
                                     restarted_services.append(svc_name)
                                 else:
                                     # Retry once — transient startup failures
@@ -6070,14 +6305,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                         text=True,
                                         timeout=15,
                                     )
-                                    _time.sleep(3)
-                                    verify2 = subprocess.run(
-                                        scope_cmd + ["is-active", svc_name],
-                                        capture_output=True,
-                                        text=True,
-                                        timeout=5,
-                                    )
-                                    if verify2.stdout.strip() == "active":
+                                    if _wait_for_service_active(
+                                        scope_cmd, svc_name, timeout=10.0,
+                                    ):
                                         restarted_services.append(svc_name)
                                         print(f"  ✓ {svc_name} recovered on retry")
                                     else:
@@ -6578,9 +6808,15 @@ def cmd_dashboard(args):
     try:
         import fastapi  # noqa: F401
         import uvicorn  # noqa: F401
-    except ImportError:
-        print("Web UI dependencies not installed.")
-        print(f"Install them with:  {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'")
+    except ImportError as e:
+        print("Web UI dependencies not installed (need fastapi + uvicorn).")
+        print(
+            f"Re-install the package into this interpreter so metadata updates apply:\n"
+            f"  cd {PROJECT_ROOT}\n"
+            f"  {sys.executable} -m pip install -e .\n"
+            "If `pip` is missing in this venv, use:  uv pip install -e ."
+        )
+        print(f"Import error: {e}")
         sys.exit(1)
 
     if "HERMES_WEB_DIST" not in os.environ:
@@ -6589,11 +6825,13 @@ def cmd_dashboard(args):
 
     from hermes_cli.web_server import start_server
 
+    embedded_chat = args.tui or os.environ.get("HERMES_DASHBOARD_TUI") == "1"
     start_server(
         host=args.host,
         port=args.port,
         open_browser=not args.no_open,
         allow_public=getattr(args, "insecure", False),
+        embedded_chat=embedded_chat,
     )
 
 
@@ -6680,6 +6918,40 @@ For more help on a command:
 
     parser.add_argument(
         "--version", "-V", action="store_true", help="Show version and exit"
+    )
+    parser.add_argument(
+        "-z",
+        "--oneshot",
+        metavar="PROMPT",
+        default=None,
+        help=(
+            "One-shot mode: send a single prompt and print ONLY the final "
+            "response text to stdout. No banner, no spinner, no tool "
+            "previews, no session_id line. Tools, memory, rules, and "
+            "AGENTS.md in the CWD are loaded as normal; approvals are "
+            "auto-bypassed. Intended for scripts / pipes."
+        ),
+    )
+    # --model / --provider are accepted at the top level so they can pair
+    # with -z without needing the `chat` subcommand.  If neither -z nor a
+    # subcommand consumes them, they fall through harmlessly as None.
+    # Mirrors `hermes chat --model ... --provider ...` semantics.
+    parser.add_argument(
+        "-m",
+        "--model",
+        default=None,
+        help=(
+            "Model override for this invocation (e.g. anthropic/claude-sonnet-4.6). "
+            "Applies to -z/--oneshot and --tui. Also settable via HERMES_INFERENCE_MODEL env var."
+        ),
+    )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "Provider override for this invocation (e.g. openrouter, anthropic). "
+            "Applies to -z/--oneshot and --tui. Also settable via HERMES_INFERENCE_PROVIDER env var."
+        ),
     )
     parser.add_argument(
         "--resume",
@@ -7231,7 +7503,7 @@ For more help on a command:
     )
     logout_parser.add_argument(
         "--provider",
-        choices=["nous", "openai-codex"],
+        choices=["nous", "openai-codex", "spotify"],
         default=None,
         help="Provider to log out from (default: active provider)",
     )
@@ -7288,6 +7560,17 @@ For more help on a command:
         "reset", help="Clear exhaustion status for all credentials for a provider"
     )
     auth_reset.add_argument("provider", help="Provider id")
+    auth_status = auth_subparsers.add_parser("status", help="Show auth status for a provider")
+    auth_status.add_argument("provider", help="Provider id")
+    auth_logout = auth_subparsers.add_parser("logout", help="Log out a provider and clear stored auth state")
+    auth_logout.add_argument("provider", help="Provider id")
+    auth_spotify = auth_subparsers.add_parser("spotify", help="Authenticate Hermes with Spotify via PKCE")
+    auth_spotify.add_argument("spotify_action", nargs="?", choices=["login", "status", "logout"], default="login")
+    auth_spotify.add_argument("--client-id", help="Spotify app client_id (or set HERMES_SPOTIFY_CLIENT_ID)")
+    auth_spotify.add_argument("--redirect-uri", help="Allow-listed localhost redirect URI for your Spotify app")
+    auth_spotify.add_argument("--scope", help="Override requested Spotify scopes")
+    auth_spotify.add_argument("--no-browser", action="store_true", help="Do not attempt to open the browser automatically")
+    auth_spotify.add_argument("--timeout", type=float, help="Callback/token exchange timeout in seconds")
     auth_parser.set_defaults(func=cmd_auth)
 
     # =========================================================================
@@ -7344,6 +7627,10 @@ For more help on a command:
         "--script",
         help="Path to a Python script whose stdout is injected into the prompt each run",
     )
+    cron_create.add_argument(
+        "--workdir",
+        help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -7381,6 +7668,10 @@ For more help on a command:
     cron_edit.add_argument(
         "--script",
         help="Path to a Python script whose stdout is injected into the prompt each run. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--workdir",
+        help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
     )
 
     # lifecycle actions
@@ -8809,6 +9100,14 @@ Examples:
         action="store_true",
         help="Allow binding to non-localhost (DANGEROUS: exposes API keys on the network)",
     )
+    dashboard_parser.add_argument(
+        "--tui",
+        action="store_true",
+        help=(
+            "Expose the in-browser Chat tab (embedded `hermes --tui` via PTY/WebSocket). "
+            "Alternatively set HERMES_DASHBOARD_TUI=1."
+        ),
+    )
     dashboard_parser.set_defaults(func=cmd_dashboard)
 
     # =========================================================================
@@ -8977,6 +9276,17 @@ Examples:
                 "shell-hook registration failed at CLI startup",
                 exc_info=True,
             )
+
+    # Handle top-level --oneshot / -z: single-shot mode, stdout = final
+    # response only, nothing else. Bypasses cli.py entirely.
+    if getattr(args, "oneshot", None):
+        from hermes_cli.oneshot import run_oneshot
+
+        sys.exit(run_oneshot(
+            args.oneshot,
+            model=getattr(args, "model", None),
+            provider=getattr(args, "provider", None),
+        ))
 
     # Handle top-level --resume / --continue as shortcut to chat
     if (args.resume or args.continue_last) and args.command is None:
