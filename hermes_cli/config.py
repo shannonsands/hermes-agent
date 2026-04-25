@@ -799,6 +799,11 @@ DEFAULT_CONFIG = {
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
     "delegation": {
+        "async_default": True,  # delegate_task returns job ids by default; pass async=false for legacy blocking
+        "default_profile": "",  # empty = inherit active profile
+        "allowed_profiles": [],  # empty = all existing profiles allowed
+        "job_retention_hours": 24,
+        "approval_mode": "deny",  # subprocess children: deny flagged commands without prompting
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents

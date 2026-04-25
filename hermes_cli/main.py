@@ -1222,6 +1222,8 @@ def cmd_chat(args):
         "max_turns": getattr(args, "max_turns", None),
         "ignore_rules": getattr(args, "ignore_rules", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False),
+        "delegate_request": getattr(args, "delegate_request", None),
+        "delegate_output": getattr(args, "delegate_output", None),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -6898,6 +6900,8 @@ Examples:
     hermes openshell enable       Configure OpenShell sandboxing
     hermes openshell disable      Return tool execution defaults to host/local
     hermes chat --sandbox=openshell -q "pwd"  Run tools in an OpenShell sandbox
+    hermes delegate list          List async delegation jobs
+    hermes delegate status JOB    Show async delegation job metadata
     hermes -s hermes-agent-dev,github-auth
     hermes -w                     Start in isolated git worktree
     hermes gateway install        Install gateway background service
@@ -7205,6 +7209,8 @@ For more help on a command:
         default=None,
         help="Provider source override, e.g. OpenShell --from source",
     )
+    chat_parser.add_argument("--delegate-request", default=None, help=argparse.SUPPRESS)
+    chat_parser.add_argument("--delegate-output", default=None, help=argparse.SUPPRESS)
     chat_parser.add_argument(
         "--tui",
         action="store_true",
@@ -8306,6 +8312,44 @@ Examples:
             cmd_info["setup_fn"](plugin_parser)
     except Exception as _exc:
         logging.getLogger(__name__).debug("Sandbox plugin CLI discovery failed: %s", _exc)
+
+    # =========================================================================
+    # delegate command
+    # =========================================================================
+    delegate_parser = subparsers.add_parser(
+        "delegate",
+        help="Inspect and control async delegation jobs",
+        description="List, inspect, wait for, cancel, and tail async delegation jobs.",
+    )
+    delegate_sub = delegate_parser.add_subparsers(dest="delegate_action")
+    delegate_list = delegate_sub.add_parser("list", aliases=["ls"], help="List delegation jobs")
+    delegate_list.add_argument("--status", help="Filter by status")
+    delegate_list.add_argument("--profile", help="Filter by Hermes profile")
+    delegate_list.add_argument("--parent-session-id", help="Filter by parent session id")
+    delegate_list.add_argument("--limit", type=int, default=50, help="Maximum jobs to show")
+    delegate_list.add_argument("--json", action="store_true", help="Print JSON")
+
+    delegate_status = delegate_sub.add_parser("status", help="Show job metadata")
+    delegate_status.add_argument("job_id")
+
+    delegate_wait_p = delegate_sub.add_parser("wait", help="Wait for a job to complete")
+    delegate_wait_p.add_argument("job_id")
+    delegate_wait_p.add_argument("--timeout", type=float, default=0, help="Seconds to wait; 0 polls once")
+
+    delegate_cancel_p = delegate_sub.add_parser("cancel", help="Cancel a job")
+    delegate_cancel_p.add_argument("job_id")
+
+    delegate_logs = delegate_sub.add_parser("logs", help="Show job stdout/stderr tails")
+    delegate_logs.add_argument("job_id")
+    delegate_logs.add_argument("--tail-chars", type=int, default=12000)
+    delegate_logs.add_argument("--json", action="store_true", help="Print JSON")
+
+    def cmd_delegate(args):
+        from hermes_cli.delegate_cmd import delegate_command
+
+        delegate_command(args)
+
+    delegate_parser.set_defaults(func=cmd_delegate)
 
     # =========================================================================
     # memory command

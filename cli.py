@@ -433,11 +433,19 @@ def load_cli_config() -> Dict[str, Any]:
             },
         },
         "delegation": {
+            "async_default": True,
+            "default_profile": "",
+            "allowed_profiles": [],
+            "job_retention_hours": 24,
+            "approval_mode": "deny",
             "max_iterations": 45,  # Max tool-calling turns per child agent
             "model": "",       # Subagent model override (empty = inherit parent model)
             "provider": "",    # Subagent provider override (empty = inherit parent provider)
             "base_url": "",    # Direct OpenAI-compatible endpoint for subagents
             "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
+            "max_concurrent_children": 3,
+            "max_spawn_depth": 1,
+            "orchestrator_enabled": True,
         },
     }
     
@@ -1604,6 +1612,55 @@ def _collect_query_images(query: str | None, image_arg: str | None = None) -> tu
         seen.add(key)
         deduped.append(img)
     return message, deduped
+
+
+def _load_delegate_request(path: str | None) -> Dict[str, Any]:
+    if not path:
+        return {}
+    request_path = Path(path).expanduser()
+    try:
+        data = json.loads(request_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Could not read delegation request {request_path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Delegation request {request_path} must contain a JSON object")
+    return data
+
+
+def _format_delegate_query(payload: Dict[str, Any]) -> str:
+    goal = str(payload.get("goal") or "").strip()
+    context = str(payload.get("context") or "").strip()
+    parts = [
+        "Complete the delegated task below and return a concise final summary.",
+        "",
+        f"TASK:\n{goal}",
+    ]
+    if context:
+        parts.extend(["", f"CONTEXT:\n{context}"])
+    return "\n".join(parts)
+
+
+def _write_delegate_output(path: str | None, payload: Dict[str, Any], result: Dict[str, Any] | None, error: str = "") -> None:
+    if not path:
+        return
+    output_path = Path(path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result = result if isinstance(result, dict) else {}
+    data = {
+        "job_id": payload.get("job_id") or os.getenv("HERMES_DELEGATE_JOB_ID", ""),
+        "status": "failed" if error or result.get("failed") else "completed",
+        "final_response": result.get("final_response") or "",
+        "session_id": result.get("session_id") or "",
+        "completed": bool(result.get("completed", not error)),
+        "failed": bool(error or result.get("failed")),
+        "error": error or result.get("error", ""),
+        "api_calls": result.get("api_calls", 0),
+        "exit_reason": result.get("exit_reason", ""),
+        "updated_at": time.time(),
+    }
+    tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, output_path)
 
 
 class ChatConsole:
@@ -10916,6 +10973,8 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    delegate_request: str = None,
+    delegate_output: str = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -10990,6 +11049,46 @@ def main(
     
     # Handle query shorthand
     query = query or q
+
+    delegate_payload: Dict[str, Any] = {}
+    if delegate_request:
+        delegate_payload = _load_delegate_request(delegate_request)
+        query = _format_delegate_query(delegate_payload)
+        if delegate_payload.get("toolsets"):
+            toolsets = ",".join(str(t) for t in delegate_payload.get("toolsets") or [])
+        if delegate_payload.get("model") and not model:
+            model = str(delegate_payload.get("model"))
+        if delegate_payload.get("provider") and not provider:
+            provider = str(delegate_payload.get("provider"))
+        if delegate_payload.get("skills") and not skills:
+            skills = delegate_payload.get("skills")
+        if delegate_payload.get("resume") and not resume:
+            resume = str(delegate_payload.get("resume"))
+        if "pass_session_id" in delegate_payload and not pass_session_id:
+            raw_pass_session_id = delegate_payload.get("pass_session_id")
+            pass_session_id = (
+                raw_pass_session_id
+                if isinstance(raw_pass_session_id, bool)
+                else str(raw_pass_session_id).strip().lower() in {"1", "true", "yes", "on"}
+            )
+        if delegate_payload.get("max_iterations") and not max_turns:
+            try:
+                max_turns = int(delegate_payload.get("max_iterations"))
+            except (TypeError, ValueError):
+                pass
+        ignore_rules = True
+        os.environ["HERMES_IGNORE_RULES"] = "1"
+        sandbox_config = delegate_payload.get("sandbox_config")
+        if isinstance(sandbox_config, dict) and sandbox_config:
+            provider_name = sandbox_config.get("provider")
+            if provider_name:
+                os.environ["HERMES_SANDBOX"] = str(provider_name)
+            if sandbox_config.get("mode"):
+                os.environ["HERMES_SANDBOX_MODE"] = str(sandbox_config["mode"])
+            if sandbox_config.get("scope"):
+                os.environ["HERMES_SANDBOX_SCOPE"] = str(sandbox_config["scope"])
+            if sandbox_config.get("source"):
+                os.environ["HERMES_SANDBOX_SOURCE"] = str(sandbox_config["source"])
     
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
@@ -11041,6 +11140,9 @@ def main(
                 part for part in (cli.system_prompt, skills_prompt) if part
             ).strip()
             cli.preloaded_skills = loaded_skills
+
+    if delegate_payload:
+        cli.system_prompt = str(delegate_payload.get("system_prompt") or cli.system_prompt or "")
 
     # Inject worktree context into agent's system prompt
     if wt_info:
@@ -11130,15 +11232,28 @@ def main(
                 ):
                     cli.agent.quiet_mode = True
                     cli.agent.suppress_status_output = True
+                    if delegate_payload:
+                        try:
+                            cli.agent._delegate_depth = int(delegate_payload.get("child_depth") or 1)
+                            cli.agent._delegate_role = delegate_payload.get("role") or "leaf"
+                            cli.agent._subagent_id = delegate_payload.get("job_id") or ""
+                            cli.agent._parent_subagent_id = delegate_payload.get("parent_subagent_id") or None
+                            cli.agent._subagent_goal = delegate_payload.get("goal") or ""
+                        except Exception:
+                            pass
                     # Suppress streaming display callbacks so stdout stays
                     # machine-readable (no styled "Hermes" box, no tool-gen
                     # status lines).  The response is printed once below.
                     cli.agent.stream_delta_callback = None
                     cli.agent.tool_gen_callback = None
-                    result = cli.agent.run_conversation(
-                        user_message=effective_query,
-                        conversation_history=cli.conversation_history,
-                    )
+                    try:
+                        result = cli.agent.run_conversation(
+                            user_message=effective_query,
+                            conversation_history=cli.conversation_history,
+                        )
+                    except Exception as exc:
+                        _write_delegate_output(delegate_output, delegate_payload, None, error=str(exc))
+                        raise
                     # Sync session_id if mid-run compression created a
                     # continuation session. The exit line below reports
                     # session_id to stderr for automation wrappers; without
@@ -11149,6 +11264,9 @@ def main(
                     ):
                         cli.session_id = cli.agent.session_id
                     response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                    if isinstance(result, dict):
+                        result["session_id"] = cli.session_id
+                    _write_delegate_output(delegate_output, delegate_payload, result if isinstance(result, dict) else {}, error="")
                     if response:
                         print(response)
                     # Session ID goes to stderr so piped stdout is clean.
@@ -11158,6 +11276,12 @@ def main(
                     sys.exit(1 if isinstance(result, dict) and result.get("failed") else 0)
             
             # Exit with error code if credentials or agent init fails
+            _write_delegate_output(
+                delegate_output,
+                delegate_payload,
+                None,
+                error="Runtime credentials or agent initialization failed.",
+            )
             sys.exit(1)
         else:
             cli.show_banner()
