@@ -263,6 +263,168 @@ def _normalize_role(r: Optional[str]) -> str:
     return "leaf"
 
 
+def _normalize_sandbox_request(value: Optional[str]) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in ("inherit", "default", "auto"):
+        return None
+    if normalized in ("0", "false", "no", "off", "host", "local", "none"):
+        return "host"
+    if normalized in ("1", "true", "yes", "on", "sandbox"):
+        return "openshell"
+    return str(value).strip()
+
+
+def _load_full_config() -> dict:
+    try:
+        from cli import CLI_CONFIG
+
+        if isinstance(CLI_CONFIG, dict) and CLI_CONFIG:
+            return CLI_CONFIG
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config
+
+        return load_config()
+    except Exception:
+        return {}
+
+
+def _env_or_config(env_var: str, cfg: Dict[str, Any], key: str, default: Any = "") -> Any:
+    value = os.getenv(env_var)
+    if value not in (None, ""):
+        return value
+    return cfg.get(key, default)
+
+
+def _env_list_or_config(env_var: str, cfg: Dict[str, Any], key: str, default: Any = None) -> Any:
+    value = os.getenv(env_var)
+    if value in (None, ""):
+        return cfg.get(key, default if default is not None else [])
+    stripped = value.strip()
+    if stripped.startswith("["):
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return [part.strip() for part in stripped.split(",") if part.strip()]
+
+
+def _env_int_or_config(env_var: str, cfg: Dict[str, Any], key: str, default: int) -> int:
+    value = os.getenv(env_var)
+    if value not in (None, ""):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    try:
+        return int(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_child_sandbox_override(
+    task: Dict[str, Any],
+    top_sandbox: Optional[str],
+    top_sandbox_mode: Optional[str],
+    top_sandbox_scope: Optional[str],
+    top_sandbox_source: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Resolve delegate_task sandbox override into task env overrides.
+
+    ``None`` means inherit the process/global terminal configuration.
+    """
+
+    requested = task.get("sandbox") if "sandbox" in task else top_sandbox
+    provider = _normalize_sandbox_request(requested)
+
+    full_cfg = _load_full_config()
+    sandbox_cfg = full_cfg.get("sandbox", {}) if isinstance(full_cfg, dict) else {}
+    if not provider:
+        default = os.getenv(
+            "HERMES_SANDBOX_DELEGATION_DEFAULT",
+            str(sandbox_cfg.get("delegation_default", "inherit")) if isinstance(sandbox_cfg, dict) else "inherit",
+        ).strip().lower()
+        if default in ("inherit", "", "default"):
+            return None
+        if default == "host":
+            provider = "host"
+        elif default == "sandbox":
+            provider = str(sandbox_cfg.get("provider") or os.getenv("HERMES_SANDBOX_PROVIDER") or "openshell")
+        else:
+            provider = default
+
+    if provider == "host":
+        return {
+            "env_type": "local",
+            "sandbox_config": {"enabled": False, "provider": "host"},
+        }
+
+    mode = (
+        task.get("sandbox_mode")
+        or top_sandbox_mode
+        or os.getenv("HERMES_SANDBOX_MODE")
+        or (sandbox_cfg.get("mode") if isinstance(sandbox_cfg, dict) else None)
+        or "mirror"
+    )
+    scope = task.get("sandbox_scope") or top_sandbox_scope or ""
+    source = (
+        task.get("sandbox_source")
+        or top_sandbox_source
+        or os.getenv("HERMES_SANDBOX_SOURCE")
+        or os.getenv("HERMES_OPENSHELL_SOURCE")
+        or ""
+    )
+    openshell_cfg = {}
+    if isinstance(sandbox_cfg, dict) and isinstance(sandbox_cfg.get("openshell"), dict):
+        openshell_cfg = dict(sandbox_cfg.get("openshell") or {})
+    config = {
+        "enabled": True,
+        "provider": provider,
+        "mode": mode,
+        "scope": scope,
+        "source": source or openshell_cfg.get("from") or openshell_cfg.get("source") or "",
+        "command": _env_or_config("HERMES_OPENSHELL_COMMAND", openshell_cfg, "command", "openshell"),
+        "policy": _env_or_config("HERMES_OPENSHELL_POLICY", openshell_cfg, "policy", ""),
+        "providers": _env_list_or_config("HERMES_OPENSHELL_PROVIDERS", openshell_cfg, "providers", []),
+        "auto_providers": is_truthy_value(
+            os.getenv("HERMES_OPENSHELL_AUTO_PROVIDERS"),
+            default=bool(openshell_cfg.get("auto_providers", True)),
+        ),
+        "gpu": is_truthy_value(
+            os.getenv("HERMES_OPENSHELL_GPU"),
+            default=bool(openshell_cfg.get("gpu", False)),
+        ),
+        "gateway": _env_or_config("HERMES_OPENSHELL_GATEWAY", openshell_cfg, "gateway", "hermes-openshell"),
+        "gateway_endpoint": _env_or_config("HERMES_OPENSHELL_GATEWAY_ENDPOINT", openshell_cfg, "gateway_endpoint", ""),
+        "gateway_port": _env_int_or_config("HERMES_OPENSHELL_GATEWAY_PORT", openshell_cfg, "gateway_port", 18080),
+        "gateway_host": _env_or_config("HERMES_OPENSHELL_GATEWAY_HOST", openshell_cfg, "gateway_host", ""),
+        "remote_workspace_dir": _env_or_config(
+            "HERMES_SANDBOX_REMOTE_WORKSPACE_DIR", openshell_cfg, "remote_workspace_dir", "/sandbox"
+        ),
+        "remote_agent_workspace_dir": _env_or_config(
+            "HERMES_SANDBOX_REMOTE_AGENT_WORKSPACE_DIR", openshell_cfg, "remote_agent_workspace_dir", "/agent"
+        ),
+        "timeout_seconds": _env_int_or_config("HERMES_SANDBOX_TIMEOUT_SECONDS", openshell_cfg, "timeout_seconds", 120),
+        "mirror_excludes": _env_list_or_config(
+            "HERMES_SANDBOX_MIRROR_EXCLUDES",
+            openshell_cfg,
+            "mirror_excludes",
+            [".git", ".hermes", "node_modules", ".venv", "dist", "build", "target"],
+        ),
+        "extra_syncs": _env_or_config("HERMES_SANDBOX_EXTRA_SYNCS", openshell_cfg, "extra_syncs", []),
+    }
+    return {
+        "env_type": provider,
+        "cwd": str(config["remote_workspace_dir"]),
+        "sandbox_config": config,
+    }
+
+
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
@@ -1144,6 +1306,8 @@ def _run_single_child(
             }
         )
 
+    child_task_id = None
+    _registered_env_override = False
     try:
         if child_progress_cb:
             try:
@@ -1158,6 +1322,15 @@ def _run_single_child(
         import uuid as _uuid
 
         child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
+        sandbox_override = getattr(child, "_delegate_sandbox_override", None)
+        if isinstance(sandbox_override, dict) and sandbox_override:
+            try:
+                from tools.terminal_tool import register_task_env_overrides
+
+                register_task_env_overrides(child_task_id, sandbox_override)
+                _registered_env_override = True
+            except Exception as exc:
+                logger.debug("Failed to register subagent sandbox override: %s", exc)
         parent_task_id = getattr(parent_agent, "_current_task_id", None)
         wall_start = time.time()
         parent_reads_snapshot = (
@@ -1498,6 +1671,14 @@ def _run_single_child(
         except Exception:
             logger.debug("Failed to close child agent after delegation")
 
+        if _registered_env_override and child_task_id:
+            try:
+                from tools.terminal_tool import clear_task_env_overrides
+
+                clear_task_env_overrides(child_task_id)
+            except Exception:
+                pass
+
 
 def delegate_task(
     goal: Optional[str] = None,
@@ -1508,6 +1689,10 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    sandbox: Optional[str] = None,
+    sandbox_mode: Optional[str] = None,
+    sandbox_scope: Optional[str] = None,
+    sandbox_source: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -1654,6 +1839,13 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+            )
+            child._delegate_sandbox_override = _resolve_child_sandbox_override(
+                t,
+                sandbox,
+                sandbox_mode,
+                sandbox_scope,
+                sandbox_source,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2097,6 +2289,23 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "sandbox": {
+                            "type": "string",
+                            "description": "Per-task sandbox override: 'inherit', 'host', or a provider name such as 'openshell'.",
+                        },
+                        "sandbox_mode": {
+                            "type": "string",
+                            "enum": ["mirror", "remote"],
+                            "description": "Per-task sandbox workspace mode when the provider supports it.",
+                        },
+                        "sandbox_scope": {
+                            "type": "string",
+                            "description": "Stable per-task sandbox scope/name seed for provider runtime reuse.",
+                        },
+                        "sandbox_source": {
+                            "type": "string",
+                            "description": "Per-task provider source override, e.g. OpenShell --from source.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2139,6 +2348,26 @@ DELEGATE_TASK_SCHEMA = {
                     "Only used when acp_command is set. Example: ['--acp', '--stdio', '--model', 'claude-opus-4-6']"
                 ),
             },
+            "sandbox": {
+                "type": "string",
+                "description": (
+                    "Sandbox override for spawned subagents: 'inherit' (default), "
+                    "'host'/'local' for host execution, or a provider name such as 'openshell'."
+                ),
+            },
+            "sandbox_mode": {
+                "type": "string",
+                "enum": ["mirror", "remote"],
+                "description": "Sandbox workspace mode for spawned subagents when the provider supports it.",
+            },
+            "sandbox_scope": {
+                "type": "string",
+                "description": "Stable sandbox scope/name seed for spawned subagents.",
+            },
+            "sandbox_source": {
+                "type": "string",
+                "description": "Provider source override, e.g. OpenShell --from source.",
+            },
         },
         "required": [],
     },
@@ -2161,6 +2390,10 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        sandbox=args.get("sandbox"),
+        sandbox_mode=args.get("sandbox_mode"),
+        sandbox_scope=args.get("sandbox_scope"),
+        sandbox_source=args.get("sandbox_source"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
