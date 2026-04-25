@@ -346,6 +346,29 @@ def load_cli_config() -> Dict[str, Any]:
             "docker_volumes": [],  # host:container volume mounts for Docker backend
             "docker_mount_cwd_to_workspace": False,  # explicit opt-in only; default off for sandbox isolation
         },
+        "sandbox": {
+            "enabled": False,
+            "provider": "host",
+            "mode": "mirror",
+            "delegation_default": "inherit",
+            "openshell": {
+                "command": "openshell",
+                "from": "",
+                "policy": "",
+                "providers": [],
+                "auto_providers": True,
+                "gpu": False,
+                "gateway": "hermes-openshell",
+                "gateway_endpoint": "",
+                "gateway_port": 18080,
+                "gateway_host": "",
+                "remote_workspace_dir": "/sandbox",
+                "remote_agent_workspace_dir": "/agent",
+                "timeout_seconds": 120,
+                "mirror_excludes": [".git", ".hermes", "node_modules", ".venv", "dist", "build", "target"],
+                "extra_syncs": [],
+            },
+        },
         "browser": {
             "inactivity_timeout": 120,  # Auto-cleanup inactive browser sessions after 2 min
             "record_sessions": False,  # Auto-record browser sessions as WebM videos
@@ -574,6 +597,43 @@ def load_cli_config() -> Dict[str, Any]:
                     os.environ[env_var] = json.dumps(val)
                 else:
                     os.environ[env_var] = str(val)
+
+    sandbox_config = defaults.get("sandbox", {})
+    if isinstance(sandbox_config, dict):
+        sandbox_env_mappings = {
+            "enabled": "HERMES_SANDBOX_ENABLED",
+            "provider": "HERMES_SANDBOX_PROVIDER",
+            "mode": "HERMES_SANDBOX_MODE",
+            "delegation_default": "HERMES_SANDBOX_DELEGATION_DEFAULT",
+        }
+        for config_key, env_var in sandbox_env_mappings.items():
+            if config_key in sandbox_config and env_var not in os.environ:
+                os.environ[env_var] = str(sandbox_config[config_key])
+
+        openshell_config = sandbox_config.get("openshell", {})
+        if isinstance(openshell_config, dict):
+            openshell_env_mappings = {
+                "command": "HERMES_OPENSHELL_COMMAND",
+                "from": "HERMES_SANDBOX_SOURCE",
+                "source": "HERMES_SANDBOX_SOURCE",
+                "policy": "HERMES_OPENSHELL_POLICY",
+                "providers": "HERMES_OPENSHELL_PROVIDERS",
+                "auto_providers": "HERMES_OPENSHELL_AUTO_PROVIDERS",
+                "gpu": "HERMES_OPENSHELL_GPU",
+                "gateway": "HERMES_OPENSHELL_GATEWAY",
+                "gateway_endpoint": "HERMES_OPENSHELL_GATEWAY_ENDPOINT",
+                "gateway_port": "HERMES_OPENSHELL_GATEWAY_PORT",
+                "gateway_host": "HERMES_OPENSHELL_GATEWAY_HOST",
+                "remote_workspace_dir": "HERMES_SANDBOX_REMOTE_WORKSPACE_DIR",
+                "remote_agent_workspace_dir": "HERMES_SANDBOX_REMOTE_AGENT_WORKSPACE_DIR",
+                "timeout_seconds": "HERMES_SANDBOX_TIMEOUT_SECONDS",
+                "mirror_excludes": "HERMES_SANDBOX_MIRROR_EXCLUDES",
+                "extra_syncs": "HERMES_SANDBOX_EXTRA_SYNCS",
+            }
+            for config_key, env_var in openshell_env_mappings.items():
+                if config_key in openshell_config and env_var not in os.environ:
+                    val = openshell_config[config_key]
+                    os.environ[env_var] = json.dumps(val) if isinstance(val, list) else str(val)
     
     # Apply browser config to environment variables
     browser_config = defaults.get("browser", {})

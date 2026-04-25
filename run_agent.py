@@ -8077,6 +8077,10 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            sandbox=function_args.get("sandbox"),
+            sandbox_mode=function_args.get("sandbox_mode"),
+            sandbox_scope=function_args.get("sandbox_scope"),
+            sandbox_source=function_args.get("sandbox_source"),
             parent_agent=self,
         )
 

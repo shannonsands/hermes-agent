@@ -1183,6 +1183,17 @@ def cmd_chat(args):
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
 
+    if getattr(args, "no_sandbox", False):
+        os.environ["HERMES_SANDBOX"] = "host"
+    elif getattr(args, "sandbox", None) is not None:
+        os.environ["HERMES_SANDBOX"] = args.sandbox or "openshell"
+    if getattr(args, "sandbox_mode", None):
+        os.environ["HERMES_SANDBOX_MODE"] = args.sandbox_mode
+    if getattr(args, "sandbox_scope", None):
+        os.environ["HERMES_SANDBOX_SCOPE"] = args.sandbox_scope
+    if getattr(args, "sandbox_source", None):
+        os.environ["HERMES_SANDBOX_SOURCE"] = args.sandbox_source
+
     if use_tui:
         _launch_tui(
             getattr(args, "resume", None),
@@ -6882,6 +6893,11 @@ Examples:
     hermes config edit            Edit config in $EDITOR
     hermes config set model gpt-4 Set a config value
     hermes gateway                Run messaging gateway
+    hermes openshell --help       Show OpenShell sandbox management commands
+    hermes openshell status       Show OpenShell provider/gateway status
+    hermes openshell enable       Configure OpenShell sandboxing
+    hermes openshell disable      Return tool execution defaults to host/local
+    hermes chat --sandbox=openshell -q "pwd"  Run tools in an OpenShell sandbox
     hermes -s hermes-agent-dev,github-auth
     hermes -w                     Start in isolated git worktree
     hermes gateway install        Install gateway background service
@@ -7158,6 +7174,36 @@ For more help on a command:
         "--source",
         default=None,
         help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists.",
+    )
+    chat_parser.add_argument(
+        "--sandbox",
+        nargs="?",
+        const="openshell",
+        default=None,
+        metavar="PROVIDER",
+        help="Run Hermes tool execution in a sandbox provider (default provider: openshell)",
+    )
+    chat_parser.add_argument(
+        "--no-sandbox",
+        action="store_true",
+        default=False,
+        help="Force host/local tool execution even when sandboxing is configured",
+    )
+    chat_parser.add_argument(
+        "--sandbox-mode",
+        choices=["mirror", "remote"],
+        default=None,
+        help="Sandbox workspace mode for providers that support it",
+    )
+    chat_parser.add_argument(
+        "--sandbox-scope",
+        default=None,
+        help="Stable sandbox scope/name seed for reusing provider runtimes",
+    )
+    chat_parser.add_argument(
+        "--sandbox-source",
+        default=None,
+        help="Provider source override, e.g. OpenShell --from source",
     )
     chat_parser.add_argument(
         "--tui",
@@ -8245,7 +8291,21 @@ Examples:
             )
             cmd_info["setup_fn"](plugin_parser)
     except Exception as _exc:
-        logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
+        logging.getLogger(__name__).debug("Memory plugin CLI discovery failed: %s", _exc)
+
+    try:
+        from plugins.sandbox import discover_plugin_cli_commands as discover_sandbox_cli_commands
+
+        for cmd_info in discover_sandbox_cli_commands():
+            plugin_parser = subparsers.add_parser(
+                cmd_info["name"],
+                help=cmd_info["help"],
+                description=cmd_info.get("description", ""),
+                formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
+            )
+            cmd_info["setup_fn"](plugin_parser)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("Sandbox plugin CLI discovery failed: %s", _exc)
 
     # =========================================================================
     # memory command
