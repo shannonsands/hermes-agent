@@ -40,6 +40,7 @@ from types import SimpleNamespace
 import urllib.request
 import uuid
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse, parse_qs, urlunparse
 from openai import OpenAI
 import fire
 from datetime import datetime
@@ -73,18 +74,25 @@ from model_tools import (
     check_toolset_requirements,
 )
 from tools.terminal_tool import cleanup_vm, get_active_env, is_persistent_env
+from tools.terminal_tool import (
+    set_approval_callback as _set_approval_callback,
+    set_sudo_password_callback as _set_sudo_password_callback,
+    _get_approval_callback,
+    _get_sudo_password_callback,
+)
 from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity
-from agent.memory_manager import build_memory_context_block, sanitize_context
+from agent.memory_manager import StreamingContextScrubber, build_memory_context_block, sanitize_context
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+    HERMES_AGENT_HELP_GUIDANCE,
     build_nous_subscription_prompt,
 )
 from agent.model_metadata import (
@@ -891,7 +899,6 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
-        persist_session: bool = True,
     ):
         """
         Initialize the AI Agent.
@@ -963,7 +970,6 @@ class AIAgent:
         self.background_review_callback = None  # Optional sync callback for gateway delivery
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
-        self.persist_session = persist_session
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1033,12 +1039,16 @@ class AIAgent:
         # surface.
         # When api_mode was explicitly provided, respect it — the user
         # knows what their endpoint supports (#10473).
+        # Exception: Azure OpenAI serves gpt-5.x on /chat/completions and
+        # does NOT support the Responses API — skip the upgrade for Azure
+        # (openai.azure.com), even though it looks OpenAI-compatible.
         if (
             api_mode is None
             and self.api_mode == "chat_completions"
             and self.provider != "copilot-acp"
             and not str(self.base_url or "").lower().startswith("acp://copilot")
             and not str(self.base_url or "").lower().startswith("acp+tcp://")
+            and not self._is_azure_openai_url()
             and (
                 self._is_direct_openai_url()
                 or self._provider_model_requires_responses_api(
@@ -1208,6 +1218,10 @@ class AIAgent:
         # Deferred paragraph break flag — set after tool iterations so a
         # single "\n\n" is prepended to the next real text delta.
         self._stream_needs_break = False
+        # Stateful scrubber for <memory-context> spans split across stream
+        # deltas (#5719).  sanitize_context() alone can't survive chunk
+        # boundaries because the block regex needs both tags in one string.
+        self._stream_context_scrubber = StreamingContextScrubber()
         # Visible assistant text already delivered through live token callbacks
         # during the current model response. Used to avoid re-sending the same
         # commentary when the provider later returns it as a completed interim
@@ -1314,7 +1328,22 @@ class AIAgent:
             if api_key and base_url:
                 # Explicit credentials from CLI/gateway — construct directly.
                 # The runtime provider resolver already handled auth for us.
-                client_kwargs = {"api_key": api_key, "base_url": base_url}
+                # Extract query params (e.g. Azure api-version) from base_url
+                # and pass via default_query to prevent loss during SDK URL
+                # joining (httpx drops query string when joining paths).
+                _parsed_url = urlparse(base_url)
+                if _parsed_url.query:
+                    _clean_url = urlunparse(_parsed_url._replace(query=""))
+                    _query_params = {
+                        k: v[0] for k, v in parse_qs(_parsed_url.query).items()
+                    }
+                    client_kwargs = {
+                        "api_key": api_key,
+                        "base_url": _clean_url,
+                        "default_query": _query_params,
+                    }
+                else:
+                    client_kwargs = {"api_key": api_key, "base_url": base_url}
                 if _provider_timeout is not None:
                     client_kwargs["timeout"] = _provider_timeout
                 if self.provider == "copilot-acp":
@@ -1765,43 +1794,64 @@ class AIAgent:
         # Store for reuse in switch_model (so config override persists across model switches)
         self._config_context_length = _config_context_length
 
+        # Resolve custom_providers list once for reuse below (startup
+        # context-length override and plugin context-engine init).
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            _custom_providers = get_compatible_custom_providers(_agent_cfg)
+        except Exception:
+            _custom_providers = _agent_cfg.get("custom_providers")
+            if not isinstance(_custom_providers, list):
+                _custom_providers = []
+
         # Check custom_providers per-model context_length
-        if _config_context_length is None:
+        if _config_context_length is None and _custom_providers:
             try:
-                from hermes_cli.config import get_compatible_custom_providers
-                _custom_providers = get_compatible_custom_providers(_agent_cfg)
+                from hermes_cli.config import get_custom_provider_context_length
+                _cp_ctx_resolved = get_custom_provider_context_length(
+                    model=self.model,
+                    base_url=self.base_url,
+                    custom_providers=_custom_providers,
+                )
+                if _cp_ctx_resolved:
+                    _config_context_length = int(_cp_ctx_resolved)
             except Exception:
-                _custom_providers = _agent_cfg.get("custom_providers")
-                if not isinstance(_custom_providers, list):
-                    _custom_providers = []
-            for _cp_entry in _custom_providers:
-                if not isinstance(_cp_entry, dict):
-                    continue
-                _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
-                if _cp_url and _cp_url == self.base_url.rstrip("/"):
-                    _cp_models = _cp_entry.get("models", {})
-                    if isinstance(_cp_models, dict):
-                        _cp_model_cfg = _cp_models.get(self.model, {})
-                        if isinstance(_cp_model_cfg, dict):
-                            _cp_ctx = _cp_model_cfg.get("context_length")
-                            if _cp_ctx is not None:
-                                try:
-                                    _config_context_length = int(_cp_ctx)
-                                except (TypeError, ValueError):
-                                    logger.warning(
-                                        "Invalid context_length for model %r in "
-                                        "custom_providers: %r — must be a plain "
-                                        "integer (e.g. 256000, not '256K'). "
-                                        "Falling back to auto-detection.",
-                                        self.model, _cp_ctx,
-                                    )
-                                    print(
-                                        f"\n⚠ Invalid context_length for model {self.model!r} in custom_providers: {_cp_ctx!r}\n"
-                                        f"  Must be a plain integer (e.g. 256000, not '256K').\n"
-                                        f"  Falling back to auto-detected context window.\n",
-                                        file=sys.stderr,
-                                    )
-                    break
+                _cp_ctx_resolved = None
+
+            # Surface a clear warning if the user set a context_length but it
+            # wasn't a valid positive int — the helper silently skips those.
+            if _config_context_length is None:
+                _target = self.base_url.rstrip("/") if self.base_url else ""
+                for _cp_entry in _custom_providers:
+                    if not isinstance(_cp_entry, dict):
+                        continue
+                    _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
+                    if _target and _cp_url == _target:
+                        _cp_models = _cp_entry.get("models", {})
+                        if isinstance(_cp_models, dict):
+                            _cp_model_cfg = _cp_models.get(self.model, {})
+                            if isinstance(_cp_model_cfg, dict):
+                                _cp_ctx = _cp_model_cfg.get("context_length")
+                                if _cp_ctx is not None:
+                                    try:
+                                        _parsed = int(_cp_ctx)
+                                        if _parsed <= 0:
+                                            raise ValueError
+                                    except (TypeError, ValueError):
+                                        logger.warning(
+                                            "Invalid context_length for model %r in "
+                                            "custom_providers: %r — must be a positive "
+                                            "integer (e.g. 256000, not '256K'). "
+                                            "Falling back to auto-detection.",
+                                            self.model, _cp_ctx,
+                                        )
+                                        print(
+                                            f"\n⚠ Invalid context_length for model {self.model!r} in custom_providers: {_cp_ctx!r}\n"
+                                            f"  Must be a positive integer (e.g. 256000, not '256K').\n"
+                                            f"  Falling back to auto-detected context window.\n",
+                                            file=sys.stderr,
+                                        )
+                        break
         
         # Select context engine: config-driven (like memory providers).
         # 1. Check config.yaml context.engine setting
@@ -1851,6 +1901,7 @@ class AIAgent:
                 api_key=getattr(self, "api_key", ""),
                 config_context_length=_config_context_length,
                 provider=self.provider,
+                custom_providers=_custom_providers,
             )
             self.context_compressor.update_model(
                 model=self.model,
@@ -2141,12 +2192,23 @@ class AIAgent:
         # ── Update context compressor ──
         if hasattr(self, "context_compressor") and self.context_compressor:
             from agent.model_metadata import get_model_context_length
+            # Re-read custom_providers from live config so per-model
+            # context_length overrides are honored when switching to a
+            # custom provider mid-session (closes #15779).
+            _sm_custom_providers = None
+            try:
+                from hermes_cli.config import load_config, get_compatible_custom_providers
+                _sm_cfg = load_config()
+                _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
+            except Exception:
+                _sm_custom_providers = None
             new_context_length = get_model_context_length(
                 self.model,
                 base_url=self.base_url,
                 api_key=self.api_key,
                 provider=self.provider,
                 config_context_length=getattr(self, "_config_context_length", None),
+                custom_providers=_sm_custom_providers,
             )
             self.context_compressor.update_model(
                 model=self.model,
@@ -2365,7 +2427,10 @@ class AIAgent:
         if not self.compression_enabled:
             return
         try:
-            from agent.auxiliary_client import get_text_auxiliary_client
+            from agent.auxiliary_client import (
+                _resolve_task_provider_model,
+                get_text_auxiliary_client,
+            )
             from agent.model_metadata import (
                 MINIMUM_CONTEXT_LENGTH,
                 get_model_context_length,
@@ -2375,6 +2440,14 @@ class AIAgent:
                 "compression",
                 main_runtime=self._current_main_runtime(),
             )
+            # Best-effort aux provider label for the warning message. The
+            # configured provider may be "auto", in which case we fall back
+            # to the client's base_url hostname so the user can still tell
+            # where the compression model is actually being called.
+            try:
+                _aux_cfg_provider, _, _, _, _ = _resolve_task_provider_model("compression")
+            except Exception:
+                _aux_cfg_provider = ""
             if client is None or not aux_model:
                 msg = (
                     "⚠ No auxiliary LLM provider configured — context "
@@ -2441,10 +2514,37 @@ class AIAgent:
                         new_threshold / main_ctx
                     )
                 safe_pct = int((aux_context / main_ctx) * 100) if main_ctx else 50
+                # Build human-readable "model (provider)" labels for both
+                # the main model and the compression model so users can
+                # tell at a glance which provider each side is actually
+                # using. When the configured provider is empty or "auto",
+                # fall back to the client's base_url hostname.
+                _main_model = getattr(self, "model", "") or "?"
+                _main_provider = getattr(self, "provider", "") or ""
+                _aux_provider_label = (
+                    _aux_cfg_provider
+                    if _aux_cfg_provider and _aux_cfg_provider != "auto"
+                    else ""
+                )
+                if not _aux_provider_label:
+                    try:
+                        from urllib.parse import urlparse
+                        _aux_provider_label = (
+                            urlparse(aux_base_url).hostname or aux_base_url
+                        )
+                    except Exception:
+                        _aux_provider_label = aux_base_url or "auto"
+                _main_label = (
+                    f"{_main_model} ({_main_provider})"
+                    if _main_provider
+                    else _main_model
+                )
+                _aux_label = f"{aux_model} ({_aux_provider_label})"
                 msg = (
-                    f"⚠ Compression model ({aux_model}) context is "
-                    f"{aux_context:,} tokens, but the main model's "
-                    f"compression threshold was {old_threshold:,} tokens. "
+                    f"⚠ Compression model {_aux_label} context is "
+                    f"{aux_context:,} tokens, but the main model "
+                    f"{_main_label}'s compression threshold was "
+                    f"{old_threshold:,} tokens. "
                     f"Auto-lowered this session's threshold to "
                     f"{new_threshold:,} tokens so compression can run.\n"
                     f"  To make this permanent, edit config.yaml — either:\n"
@@ -2503,6 +2603,22 @@ class AIAgent:
                 getattr(self, "_base_url_lower", "")
             )
         return hostname == "api.openai.com"
+
+    def _is_azure_openai_url(self, base_url: str = None) -> bool:
+        """Return True when a base URL targets Azure OpenAI.
+
+        Azure OpenAI exposes an OpenAI-compatible endpoint at
+        ``{resource}.openai.azure.com/openai/v1`` that accepts the
+        standard ``openai`` Python client.  Unlike api.openai.com it
+        does NOT support the Responses API — gpt-5.x models are served
+        on the regular ``/chat/completions`` path — so routing decisions
+        must treat Azure separately from direct OpenAI.
+        """
+        if base_url is not None:
+            url = str(base_url).lower()
+        else:
+            url = getattr(self, "_base_url_lower", "") or ""
+        return "openai.azure.com" in url
 
     def _resolved_api_call_timeout(self) -> float:
         """Resolve the effective per-call request timeout in seconds.
@@ -2675,12 +2791,14 @@ class AIAgent:
 
     def _max_tokens_param(self, value: int) -> dict:
         """Return the correct max tokens kwarg for the current provider.
-        
+
         OpenAI's newer models (gpt-4o, o-series, gpt-5+) require
-        'max_completion_tokens'. OpenRouter, local models, and older
+        'max_completion_tokens'. Azure OpenAI also requires
+        'max_completion_tokens' for gpt-5.x models served via the
+        OpenAI-compatible endpoint. OpenRouter, local models, and older
         OpenAI models use 'max_tokens'.
         """
-        if self._is_direct_openai_url():
+        if self._is_direct_openai_url() or self._is_azure_openai_url():
             return {"max_completion_tokens": value}
         return {"max_tokens": value}
 
@@ -3038,13 +3156,28 @@ class AIAgent:
     )
 
     _SKILL_REVIEW_PROMPT = (
-        "Review the conversation above and consider saving or updating a skill if appropriate.\n\n"
-        "Focus on: was a non-trivial approach used to complete a task that required trial "
-        "and error, or changing course due to experiential findings along the way, or did "
-        "the user expect or desire a different method or outcome?\n\n"
-        "If a relevant skill already exists, update it with what you learned. "
-        "Otherwise, create a new skill if the approach is reusable.\n"
-        "If nothing is worth saving, just say 'Nothing to save.' and stop."
+        "Review the conversation above and consider whether a skill should be saved or updated.\n\n"
+        "Work in this order — do not skip steps:\n\n"
+        "1. SURVEY the existing skill landscape first. Call skills_list to see what you "
+        "have. If anything looks potentially relevant, skill_view it before deciding. "
+        "You are looking for the CLASS of task that just happened, not the exact task. "
+        "Example: a successful Tauri build is in the class \"desktop app build "
+        "troubleshooting\", not \"fix my specific Tauri error today\".\n\n"
+        "2. THINK CLASS-FIRST. What general pattern of task did the user just complete? "
+        "What conditions will trigger this pattern again? Describe the class in one "
+        "sentence before looking at what to save.\n\n"
+        "3. PREFER GENERALIZING AN EXISTING SKILL over creating a new one. If a skill "
+        "already covers the class — even partially — update it (skill_manage patch) "
+        "with the new insight. Broaden its \"when to use\" trigger if needed.\n\n"
+        "4. ONLY CREATE A NEW SKILL when no existing skill reasonably covers the class. "
+        "When you create one, name and scope it at the class level "
+        "(\"react-i18n-setup\", not \"add-i18n-to-my-dashboard-app\"). The trigger "
+        "section must describe the class of situations, not this one session.\n\n"
+        "5. If you notice two existing skills that overlap, note it in your response "
+        "so a future review can consolidate them. Do not consolidate now unless the "
+        "overlap is obvious and low-risk.\n\n"
+        "Only act when something is genuinely worth saving. "
+        "If nothing stands out, just say 'Nothing to save.' and stop."
     )
 
     _COMBINED_REVIEW_PROMPT = (
@@ -3054,9 +3187,16 @@ class AIAgent:
         "about how you should behave, their work style, or ways they want you to operate? "
         "If so, save using the memory tool.\n\n"
         "**Skills**: Was a non-trivial approach used to complete a task that required trial "
-        "and error, or changing course due to experiential findings along the way, or did "
-        "the user expect or desire a different method or outcome? If a relevant skill "
-        "already exists, update it. Otherwise, create a new one if the approach is reusable.\n\n"
+        "and error, changing course due to experiential findings, or a different method "
+        "or outcome than the user expected? If so, work in this order:\n"
+        "  a. SURVEY existing skills first (skills_list, then skill_view on candidates).\n"
+        "  b. Identify the CLASS of task, not the specific task "
+        "(\"desktop app build troubleshooting\", not \"fix my Tauri error\").\n"
+        "  c. PREFER UPDATING/GENERALIZING an existing skill that covers the class.\n"
+        "  d. ONLY CREATE A NEW SKILL if no existing one covers the class. Scope at "
+        "the class level, not this one session.\n"
+        "  e. If you notice overlapping skills during the survey, note it so a future "
+        "review can consolidate them.\n\n"
         "Only act if there's something genuinely worth saving. "
         "If nothing stands out, just say 'Nothing to save.' and stop."
     )
@@ -3149,18 +3289,47 @@ class AIAgent:
 
         def _run_review():
             import contextlib
+            # Install a non-interactive approval callback on this worker
+            # thread so any dangerous-command guard the review agent trips
+            # resolves to "deny" instead of falling back to input() -- which
+            # deadlocks against the parent's prompt_toolkit TUI (#15216).
+            # Same pattern as _subagent_auto_deny in tools/delegate_tool.py.
+            def _bg_review_auto_deny(command, description, **kwargs):
+                logger.warning(
+                    "Background review auto-denied dangerous command: %s (%s)",
+                    command, description,
+                )
+                return "deny"
+            try:
+                _set_approval_callback(_bg_review_auto_deny)
+            except Exception:
+                pass
             review_agent = None
             try:
                 with open(os.devnull, "w") as _devnull, \
                      contextlib.redirect_stdout(_devnull), \
                      contextlib.redirect_stderr(_devnull):
+                    # Inherit the parent agent's live runtime (provider, model,
+                    # base_url, api_key, api_mode) so the fork uses the exact
+                    # same credentials the main turn is using.  Without this,
+                    # AIAgent.__init__ re-runs auto-resolution from env vars,
+                    # which fails for OAuth-only providers, session-scoped
+                    # creds, or credential-pool setups where the resolver can't
+                    # reconstruct auth from scratch -- producing the spurious
+                    # "No LLM provider configured" warning at end of turn.
+                    _parent_runtime = self._current_main_runtime()
                     review_agent = AIAgent(
                         model=self.model,
                         max_iterations=8,
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
+                        api_mode=_parent_runtime.get("api_mode") or None,
+                        base_url=_parent_runtime.get("base_url") or None,
+                        api_key=_parent_runtime.get("api_key") or None,
+                        credential_pool=getattr(self, "_credential_pool", None),
                         parent_session_id=self.session_id,
+                        enabled_toolsets=["memory", "skills"],
                     )
                     review_agent._memory_write_origin = "background_review"
                     review_agent._memory_write_context = "background_review"
@@ -3200,14 +3369,29 @@ class AIAgent:
                 logger.warning("Background memory/skill review failed: %s", e)
                 self._emit_auxiliary_failure("background review", e)
             finally:
-                # Close all resources (httpx client, subprocesses, etc.) so
-                # GC doesn't try to clean them up on a dead asyncio event
-                # loop (which produces "Event loop is closed" errors).
+                # Background review agents can initialize memory providers
+                # (for example Hindsight) that own their own network clients.
+                # Explicitly stop those providers before closing the agent so
+                # their aiohttp sessions do not leak until GC/process exit.
+                # Then close all remaining resources (httpx client,
+                # subprocesses, etc.) so GC doesn't try to clean them up on a
+                # dead asyncio event loop (which produces "Event loop is
+                # closed" errors).
                 if review_agent is not None:
+                    try:
+                        review_agent.shutdown_memory_provider()
+                    except Exception:
+                        pass
                     try:
                         review_agent.close()
                     except Exception:
                         pass
+                # Clear the approval callback on this bg-review thread so a
+                # recycled thread-id doesn't inherit a stale reference.
+                try:
+                    _set_approval_callback(None)
+                except Exception:
+                    pass
 
         t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
         t.start()
@@ -3260,10 +3444,7 @@ class AIAgent:
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
-        Skipped when ``persist_session=False`` (ephemeral helper flows).
         """
-        if not self.persist_session:
-            return
         self._apply_persist_user_message_override(messages)
         self._session_messages = messages
         self._save_session_log(messages)
@@ -3313,6 +3494,7 @@ class AIAgent:
                     reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
+                    codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
@@ -4387,6 +4569,9 @@ class AIAgent:
             # Fallback to hardcoded identity
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
 
+        # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
+        prompt_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
         if "memory" in self.valid_tool_names:
@@ -5115,7 +5300,39 @@ class AIAgent:
             logger.debug("Dead connection check error: %s", exc)
         return False
 
-    def _create_request_openai_client(self, *, reason: str) -> Any:
+    @staticmethod
+    def _api_kwargs_have_image_parts(api_kwargs: dict) -> bool:
+        """Return True when the outbound request still contains native image parts."""
+        if not isinstance(api_kwargs, dict):
+            return False
+        candidates = []
+        messages = api_kwargs.get("messages")
+        if isinstance(messages, list):
+            candidates.extend(messages)
+        # Responses API payloads use `input`; after conversion, image parts can
+        # still be present there instead of in `messages`.
+        response_input = api_kwargs.get("input")
+        if isinstance(response_input, list):
+            candidates.extend(response_input)
+
+        def _contains_image(value: Any) -> bool:
+            if isinstance(value, dict):
+                ptype = value.get("type")
+                if ptype in {"image_url", "input_image"}:
+                    return True
+                return any(_contains_image(v) for v in value.values())
+            if isinstance(value, list):
+                return any(_contains_image(v) for v in value)
+            return False
+
+        return any(_contains_image(item) for item in candidates)
+
+    def _copilot_headers_for_request(self, *, is_vision: bool) -> dict:
+        from hermes_cli.copilot_auth import copilot_request_headers
+
+        return copilot_request_headers(is_agent_turn=True, is_vision=is_vision)
+
+    def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
 
         primary_client = self._ensure_primary_openai_client(reason=reason)
@@ -5123,6 +5340,11 @@ class AIAgent:
             return primary_client
         with self._openai_client_lock():
             request_kwargs = dict(self._client_kwargs)
+        if (
+            base_url_host_matches(str(request_kwargs.get("base_url", "")), "api.githubcopilot.com")
+            and self._api_kwargs_have_image_parts(api_kwargs or {})
+        ):
+            request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
         return self._create_openai_client(request_kwargs, reason=reason, shared=False)
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
@@ -5437,6 +5659,11 @@ class AIAgent:
         # Other anthropic_messages providers (MiniMax, Alibaba, etc.) use their own keys.
         if self.provider != "anthropic":
             return False
+        # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
+        # Refreshing would pick up ~/.claude/.credentials.json OAuth token and break auth.
+        _base = getattr(self, "_anthropic_base_url", "") or ""
+        if "azure.com" in _base:
+            return False
 
         try:
             from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
@@ -5660,7 +5887,10 @@ class AIAgent:
         def _call():
             try:
                 if self.api_mode == "codex_responses":
-                    request_client_holder["client"] = self._create_request_openai_client(reason="codex_stream_request")
+                    request_client_holder["client"] = self._create_request_openai_client(
+                        reason="codex_stream_request",
+                        api_kwargs=api_kwargs,
+                    )
                     result["response"] = self._run_codex_stream(
                         api_kwargs,
                         client=request_client_holder["client"],
@@ -5692,7 +5922,10 @@ class AIAgent:
                         raise
                     result["response"] = normalize_converse_response(raw_response)
                 else:
-                    request_client_holder["client"] = self._create_request_openai_client(reason="chat_completion_request")
+                    request_client_holder["client"] = self._create_request_openai_client(
+                        reason="chat_completion_request",
+                        api_kwargs=api_kwargs,
+                    )
                     result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
             except Exception as e:
                 result["error"] = e
@@ -5790,6 +6023,20 @@ class AIAgent:
 
     def _reset_stream_delivery_tracking(self) -> None:
         """Reset tracking for text delivered during the current model response."""
+        # Flush any benign partial-tag tail held by the context scrubber so it
+        # reaches the UI before we clear state for the next model call.  If
+        # the scrubber is mid-span, flush() drops the orphaned content.
+        scrubber = getattr(self, "_stream_context_scrubber", None)
+        if scrubber is not None:
+            tail = scrubber.flush()
+            if tail:
+                callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+                for cb in callbacks:
+                    try:
+                        cb(tail)
+                    except Exception:
+                        pass
+                self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
 
     def _record_streamed_assistant_text(self, text: str) -> None:
@@ -5840,6 +6087,28 @@ class AIAgent:
         if getattr(self, "_stream_needs_break", False) and text and text.strip():
             self._stream_needs_break = False
             text = "\n\n" + text
+            prepended_break = True
+        else:
+            prepended_break = False
+        if isinstance(text, str):
+            # Strip <think> blocks first (per-delta is safe for closed pairs; the
+            # unterminated-tag path is handled downstream by stream_consumer).
+            # Then feed through the stateful context scrubber so memory-context
+            # spans split across chunks cannot leak to the UI (#5719).
+            text = self._strip_think_blocks(text or "")
+            scrubber = getattr(self, "_stream_context_scrubber", None)
+            if scrubber is not None:
+                text = scrubber.feed(text)
+            else:
+                # Defensive: legacy callers without the scrubber attribute.
+                text = sanitize_context(text)
+            # Only strip leading newlines on the first delta — mid-stream "\n" is legitimate markdown.
+            if not prepended_break and not getattr(
+                self, "_current_streamed_assistant_text", ""
+            ):
+                text = text.lstrip("\n")
+        if not text:
+            return
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False
         for cb in callbacks:
@@ -6035,7 +6304,8 @@ class AIAgent:
                 ),
             }
             request_client_holder["client"] = self._create_request_openai_client(
-                reason="chat_completion_stream_request"
+                reason="chat_completion_stream_request",
+                api_kwargs=stream_kwargs,
             )
             # Reset stale-stream timer so the detector measures from this
             # attempt's start, not a previous attempt's last chunk.
@@ -6793,10 +7063,15 @@ class AIAgent:
             # Determine api_mode from provider / base URL / model
             fb_api_mode = "chat_completions"
             fb_base_url = str(fb_client.base_url)
+            _fb_is_azure = self._is_azure_openai_url(fb_base_url)
             if fb_provider == "openai-codex":
                 fb_api_mode = "codex_responses"
             elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
                 fb_api_mode = "anthropic_messages"
+            elif _fb_is_azure:
+                # Azure OpenAI serves gpt-5.x on /chat/completions — does NOT
+                # support the Responses API. Stay on chat_completions.
+                fb_api_mode = "chat_completions"
             elif self._is_direct_openai_url(fb_base_url):
                 fb_api_mode = "codex_responses"
             elif self._provider_model_requires_responses_api(
@@ -7162,6 +7437,26 @@ class AIAgent:
         self._anthropic_image_fallback_cache[cache_key] = note
         return note
 
+    def _model_supports_vision(self) -> bool:
+        """Return True if the active provider+model reports native vision.
+
+        Used to decide whether to strip image content parts from API-bound
+        messages (for non-vision models) or let the provider adapter handle
+        them natively (for vision-capable models).
+        """
+        try:
+            from agent.models_dev import get_model_capabilities
+            provider = (getattr(self, "provider", "") or "").strip()
+            model = (getattr(self, "model", "") or "").strip()
+            if not provider or not model:
+                return False
+            caps = get_model_capabilities(provider, model)
+            if caps is None:
+                return False
+            return bool(caps.supports_vision)
+        except Exception:
+            return False
+
     def _preprocess_anthropic_content(self, content: Any, role: str) -> Any:
         if not self._content_has_image_parts(content):
             return content
@@ -7225,12 +7520,23 @@ class AIAgent:
         return t
 
     def _prepare_anthropic_messages_for_api(self, api_messages: list) -> list:
+        # Fast exit when no message carries image content at all.
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
             for msg in api_messages
         ):
             return api_messages
 
+        # The Anthropic adapter (agent/anthropic_adapter.py:_convert_content_part_to_anthropic)
+        # already translates OpenAI-style image_url/input_image parts into
+        # native Anthropic ``{"type": "image", "source": ...}`` blocks. When
+        # the active model supports vision we let the adapter do its job and
+        # skip this legacy text-fallback preprocessor entirely.
+        if self._model_supports_vision():
+            return api_messages
+
+        # Non-vision Anthropic model (rare today, but keep the fallback for
+        # compat): replace each image part with a vision_analyze text note.
         transformed = copy.deepcopy(api_messages)
         for msg in transformed:
             if not isinstance(msg, dict):
@@ -7240,6 +7546,150 @@ class AIAgent:
                 str(msg.get("role", "user") or "user"),
             )
         return transformed
+
+    def _prepare_messages_for_non_vision_model(self, api_messages: list) -> list:
+        """Strip native image parts when the active model lacks vision.
+
+        Runs on the chat.completions / codex_responses paths. Vision-capable
+        models pass through unchanged (provider and any downstream translator
+        handle the image parts natively). Non-vision models get each image
+        replaced by a cached vision_analyze text description so the turn
+        doesn't fail with "model does not support image input".
+        """
+        if not any(
+            isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
+            for msg in api_messages
+        ):
+            return api_messages
+
+        if self._model_supports_vision():
+            return api_messages
+
+        transformed = copy.deepcopy(api_messages)
+        for msg in transformed:
+            if not isinstance(msg, dict):
+                continue
+            # Reuse the Anthropic text-fallback preprocessor — the behaviour is
+            # identical (walk content parts, replace images with cached
+            # descriptions, merge back into a single text or structured
+            # content). Naming is historical.
+            msg["content"] = self._preprocess_anthropic_content(
+                msg.get("content"),
+                str(msg.get("role", "user") or "user"),
+            )
+        return transformed
+
+    def _try_shrink_image_parts_in_messages(self, api_messages: list) -> bool:
+        """Re-encode all native image parts at a smaller size to recover from
+        image-too-large errors (Anthropic 5 MB, unknown other providers).
+
+        Mutates ``api_messages`` in place. Returns True if any image part was
+        actually replaced, False if there were no image parts to shrink or
+        Pillow couldn't help (caller should surface the original error).
+
+        Strategy: look for ``image_url`` / ``input_image`` parts carrying a
+        ``data:image/...;base64,...`` payload.  For each one whose encoded
+        size exceeds 4 MB (a safe target that slides under Anthropic's 5 MB
+        ceiling with header overhead), write the base64 to a tempfile, call
+        ``vision_tools._resize_image_for_vision`` to produce a smaller data
+        URL, and substitute it in place.
+
+        Non-data-URL images (http/https URLs) are not touched — the provider
+        fetches those itself and the size limit is different.
+        """
+        if not api_messages:
+            return False
+
+        try:
+            from tools.vision_tools import _resize_image_for_vision
+        except Exception as exc:
+            logger.warning("image-shrink recovery: vision_tools unavailable — %s", exc)
+            return False
+
+        # 4 MB target leaves comfortable headroom under Anthropic's 5 MB.
+        # Non-Anthropic providers we haven't observed rejecting are fine with
+        # much larger; shrinking to 4 MB here loses quality but only fires
+        # after a confirmed provider rejection, so the alternative is failure.
+        target_bytes = 4 * 1024 * 1024
+        changed_count = 0
+
+        def _shrink_data_url(url: str) -> Optional[str]:
+            """Return a smaller data URL, or None if shrink can't help."""
+            if not isinstance(url, str) or not url.startswith("data:"):
+                return None
+            if len(url) <= target_bytes:
+                # This specific image wasn't the oversized one.
+                return None
+            try:
+                header, _, data = url.partition(",")
+                mime = "image/jpeg"
+                if header.startswith("data:"):
+                    mime_part = header[len("data:"):].split(";", 1)[0].strip()
+                    if mime_part.startswith("image/"):
+                        mime = mime_part
+                import base64 as _b64
+                raw = _b64.b64decode(data)
+                suffix = {
+                    "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+                    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/bmp": ".bmp",
+                }.get(mime, ".jpg")
+                tmp = tempfile.NamedTemporaryFile(
+                    prefix="hermes_shrink_", suffix=suffix, delete=False,
+                )
+                try:
+                    tmp.write(raw)
+                    tmp.close()
+                    resized = _resize_image_for_vision(
+                        Path(tmp.name),
+                        mime_type=mime,
+                        max_base64_bytes=target_bytes,
+                    )
+                finally:
+                    try:
+                        Path(tmp.name).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                if not resized or len(resized) >= len(url):
+                    # Shrink didn't help (or made it bigger — corrupt input?).
+                    return None
+                return resized
+            except Exception as exc:
+                logger.warning("image-shrink recovery: re-encode failed — %s", exc)
+                return None
+
+        for msg in api_messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype not in {"image_url", "input_image"}:
+                    continue
+                image_value = part.get("image_url")
+                # OpenAI chat.completions: {"image_url": {"url": "data:..."}}
+                # OpenAI Responses: {"image_url": "data:..."}
+                if isinstance(image_value, dict):
+                    url = image_value.get("url", "")
+                    resized = _shrink_data_url(url)
+                    if resized:
+                        image_value["url"] = resized
+                        changed_count += 1
+                elif isinstance(image_value, str):
+                    resized = _shrink_data_url(image_value)
+                    if resized:
+                        part["image_url"] = resized
+                        changed_count += 1
+
+        if changed_count:
+            logger.info(
+                "image-shrink recovery: re-encoded %d image part(s) to fit under %.0f MB",
+                changed_count, target_bytes / (1024 * 1024),
+            )
+        return changed_count > 0
 
     def _anthropic_preserve_dots(self) -> bool:
         """True when using an anthropic-compatible endpoint that preserves dots in model names.
@@ -7389,9 +7839,10 @@ class AIAgent:
                 )
             )
             is_xai_responses = self.provider == "xai" or self._base_url_hostname == "api.x.ai"
+            _msgs_for_codex = self._prepare_messages_for_non_vision_model(api_messages)
             return _ct.build_kwargs(
                 model=self.model,
-                messages=api_messages,
+                messages=_msgs_for_codex,
                 tools=self.tools,
                 reasoning_config=self.reasoning_config,
                 session_id=getattr(self, "session_id", None),
@@ -7470,9 +7921,12 @@ class AIAgent:
         if _ephemeral_out is not None:
             self._ephemeral_max_output_tokens = None
 
+        # Strip image parts for non-vision models (no-op when vision-capable).
+        _msgs_for_chat = self._prepare_messages_for_non_vision_model(api_messages)
+
         return _ct.build_kwargs(
             model=self.model,
-            messages=api_messages,
+            messages=_msgs_for_chat,
             tools=self.tools,
             timeout=self._resolved_api_call_timeout(),
             max_tokens=self.max_tokens,
@@ -7669,6 +8123,13 @@ class AIAgent:
         if codex_items:
             msg["codex_reasoning_items"] = codex_items
 
+        # Codex Responses API: preserve exact assistant message items (with
+        # id/phase) so follow-up turns can replay structured items instead of
+        # flattening to plain text. This is required for prefix cache hits.
+        codex_message_items = getattr(assistant_message, "codex_message_items", None)
+        if codex_message_items:
+            msg["codex_message_items"] = codex_message_items
+
         if assistant_message.tool_calls:
             tool_calls = []
             for tool_call in assistant_message.tool_calls:
@@ -7754,25 +8215,59 @@ class AIAgent:
         if source_msg.get("role") != "assistant":
             return
 
-        explicit_reasoning = source_msg.get("reasoning_content")
-        if isinstance(explicit_reasoning, str):
-            api_msg["reasoning_content"] = explicit_reasoning
+        # 1. Explicit reasoning_content already set — preserve it verbatim
+        # (includes DeepSeek/Kimi's own empty-string placeholder written at
+        # creation time, and any valid reasoning content from the same provider).
+        existing = source_msg.get("reasoning_content")
+        if isinstance(existing, str):
+            api_msg["reasoning_content"] = existing
             return
 
+        needs_thinking_pad = (
+            self._needs_kimi_tool_reasoning()
+            or self._needs_deepseek_tool_reasoning()
+        )
+
+        # 2. Cross-provider poisoned history (#15748): on DeepSeek/Kimi,
+        # if the source turn has tool_calls AND a 'reasoning' field but no
+        # 'reasoning_content' key, the 'reasoning' text was written by a
+        # prior provider (e.g. MiniMax) — DeepSeek's own _build_assistant_message
+        # always pins reasoning_content="" at creation time for tool-call turns,
+        # so the shape (reasoning set, reasoning_content absent, tool_calls
+        # present) is unreachable from same-provider DeepSeek history. Inject
+        # "" to satisfy the API without leaking another provider's chain of
+        # thought to DeepSeek/Kimi.
         normalized_reasoning = source_msg.get("reasoning")
+        if (
+            needs_thinking_pad
+            and source_msg.get("tool_calls")
+            and isinstance(normalized_reasoning, str)
+            and normalized_reasoning
+        ):
+            api_msg["reasoning_content"] = ""
+            return
+
+        # 3. Healthy session: promote 'reasoning' field to 'reasoning_content'
+        # for providers that use the internal 'reasoning' key.
+        # This must happen BEFORE the DeepSeek/Kimi tool-call check so that
+        # genuine reasoning content is not overwritten by the empty-string
+        # fallback (#15812 regression in PR #15478).
         if isinstance(normalized_reasoning, str) and normalized_reasoning:
             api_msg["reasoning_content"] = normalized_reasoning
             return
 
-        # Providers that require an echoed reasoning_content on every
-        # assistant tool-call turn. Detection logic lives in the per-provider
-        # helpers so both the creation path (_build_assistant_message) and
-        # this replay path stay in sync.
-        if source_msg.get("tool_calls") and (
-            self._needs_kimi_tool_reasoning()
-            or self._needs_deepseek_tool_reasoning()
-        ):
+        # 4. DeepSeek / Kimi thinking mode: all assistant messages need
+        # reasoning_content. Inject "" to satisfy the provider's requirement
+        # when no explicit reasoning content is present. Covers both
+        # tool-call turns (already-poisoned history with no reasoning at all)
+        # and plain text turns.
+        if needs_thinking_pad:
             api_msg["reasoning_content"] = ""
+            return
+
+        # 5. reasoning_content was present but not a string (e.g. None after
+        # context compaction).  Don't pass null to the API.
+        api_msg.pop("reasoning_content", None)
 
     @staticmethod
     def _sanitize_tool_calls_for_strict_api(api_msg: dict) -> dict:
@@ -7965,6 +8460,23 @@ class AIAgent:
                     f"⚠ Compression summary failed: {summary_error}. "
                     "Inserted a fallback context marker."
                 )
+        else:
+            # No hard failure — but did the configured aux model error out
+            # and get recovered by retrying on main?  Surface that so users
+            # know their auxiliary.compression.model setting is broken even
+            # though compression succeeded.
+            _aux_fail_model = getattr(self.context_compressor, "_last_aux_model_failure_model", None)
+            _aux_fail_err = getattr(self.context_compressor, "_last_aux_model_failure_error", None)
+            if _aux_fail_model:
+                # Dedup on (model, error) so we don't spam on every compaction
+                _aux_key = (_aux_fail_model, _aux_fail_err)
+                if getattr(self, "_last_aux_fallback_warning_key", None) != _aux_key:
+                    self._last_aux_fallback_warning_key = _aux_key
+                    self._emit_warning(
+                        f"ℹ Configured compression model '{_aux_fail_model}' failed "
+                        f"({_aux_fail_err or 'unknown error'}). Recovered using main model — "
+                        "check auxiliary.compression.model in config.yaml."
+                    )
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
@@ -8003,6 +8515,22 @@ class AIAgent:
                 self._last_flushed_db_idx = 0
             except Exception as e:
                 logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+
+        # Notify the context engine that the session_id rotated because of
+        # compression (not a fresh /new). Plugin engines (e.g. hermes-lcm) use
+        # boundary_reason="compression" to preserve DAG lineage across the
+        # rollover instead of re-initializing fresh per-session state.
+        # See hermes-lcm#68. Built-in ContextCompressor ignores kwargs.
+        try:
+            _old_sid = locals().get("old_session_id")
+            if _old_sid and hasattr(self.context_compressor, "on_session_start"):
+                self.context_compressor.on_session_start(
+                    self.session_id or "",
+                    boundary_reason="compression",
+                    old_session_id=_old_sid,
+                )
+        except Exception as _ce_err:
+            logger.debug("context engine on_session_start (compression): %s", _ce_err)
 
         # Warn on repeated compressions (quality degrades with each pass)
         _cc = self.context_compressor.compression_count
@@ -8291,6 +8819,14 @@ class AIAgent:
         self._current_tool = tool_names_str
         self._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
+        # Capture CLI callbacks from the agent thread so worker threads can
+        # register them locally.  Without this, _get_approval_callback() in
+        # terminal_tool returns None in ThreadPoolExecutor workers, causing
+        # the dangerous-command prompt to fall back to input() — which
+        # deadlocks against prompt_toolkit's raw terminal mode (#13617).
+        _parent_approval_cb = _get_approval_callback()
+        _parent_sudo_cb = _get_sudo_password_callback()
+
         def _run_tool(index, tool_call, function_name, function_args):
             """Worker function executed in a thread."""
             # Register this worker tid so the agent can fan out an interrupt
@@ -8317,6 +8853,18 @@ class AIAgent:
                 set_activity_callback(self._touch_activity)
             except Exception:
                 pass
+            # Propagate approval/sudo callbacks to this worker thread.
+            # Mirrors cli.py run_agent() pattern (GHSA-qg5c-hvr5-hjgr).
+            if _parent_approval_cb is not None:
+                try:
+                    _set_approval_callback(_parent_approval_cb)
+                except Exception:
+                    pass
+            if _parent_sudo_cb is not None:
+                try:
+                    _set_sudo_password_callback(_parent_sudo_cb)
+                except Exception:
+                    pass
             start = time.time()
             try:
                 result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id, messages=messages)
@@ -8337,6 +8885,13 @@ class AIAgent:
                 self._tool_worker_threads.discard(_worker_tid)
             try:
                 _set_interrupt(False, _worker_tid)
+            except Exception:
+                pass
+            # Clear thread-local callbacks so a recycled worker thread
+            # doesn't hold stale references to a disposed CLI instance.
+            try:
+                _set_approval_callback(None)
+                _set_sudo_password_callback(None)
             except Exception:
                 pass
 
@@ -9098,16 +9653,6 @@ class AIAgent:
         if isinstance(persist_user_message, str):
             persist_user_message = _sanitize_surrogates(persist_user_message)
 
-        # Strip leaked <memory-context> blocks from user input.  When Honcho's
-        # saveMessages persists a turn that included injected context, the block
-        # can reappear in the next turn's user message via message history.
-        # Stripping here prevents stale memory tags from leaking into the
-        # conversation and being visible to the user or the model as user text.
-        if isinstance(user_message, str):
-            user_message = sanitize_context(user_message)
-        if isinstance(persist_user_message, str):
-            persist_user_message = sanitize_context(persist_user_message)
-
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
         self._persist_user_message_idx = None
@@ -9185,6 +9730,13 @@ class AIAgent:
         
         # Track user turns for memory flush and periodic nudge logic
         self._user_turn_count += 1
+
+        # Reset the streaming context scrubber at the top of each turn so a
+        # hung span from a prior interrupted stream can't taint this turn's
+        # output.
+        scrubber = getattr(self, "_stream_context_scrubber", None)
+        if scrubber is not None:
+            scrubber.reset()
 
         # Preserve the original user message (no nudge injection).
         original_user_message = persist_user_message if persist_user_message is not None else user_message
@@ -9713,6 +10265,7 @@ class AIAgent:
             nous_auth_retry_attempted=False
             copilot_auth_retry_attempted=False
             thinking_sig_retry_attempted = False
+            image_shrink_retry_attempted = False
             has_retried_429 = False
             restart_with_compressed_messages = False
             restart_with_length_continuation = False
@@ -10634,6 +11187,31 @@ class AIAgent:
                     )
                     if recovered_with_pool:
                         continue
+
+                    # Image-too-large recovery: shrink oversized native image
+                    # parts in-place and retry once.  Triggered by Anthropic's
+                    # per-image 5 MB ceiling (400 with "image exceeds 5 MB
+                    # maximum") or any other provider that complains about
+                    # image size.  If shrink fails or a second attempt still
+                    # fails, fall through to normal error handling.
+                    if (
+                        classified.reason == FailoverReason.image_too_large
+                        and not image_shrink_retry_attempted
+                    ):
+                        image_shrink_retry_attempted = True
+                        if self._try_shrink_image_parts_in_messages(api_messages):
+                            self._vprint(
+                                f"{self.log_prefix}📐 Image(s) exceeded provider size limit — "
+                                f"shrank and retrying...",
+                                force=True,
+                            )
+                            continue
+                        else:
+                            logger.info(
+                                "image-shrink recovery: no data-URL image parts found "
+                                "or shrink didn't reduce size; surfacing original error."
+                            )
+
                     if (
                         self.api_mode == "codex_responses"
                         and self.provider == "openai-codex"
@@ -10897,36 +11475,69 @@ class AIAgent:
                                 continue
 
                     # ── Nous Portal: record rate limit & skip retries ─────
-                    # When Nous returns a 429, record the reset time to a
-                    # shared file so ALL sessions (cron, gateway, auxiliary)
-                    # know not to pile on.  Then skip further retries —
-                    # each one burns another RPH request and deepens the
-                    # rate limit hole.  The retry loop's top-of-iteration
-                    # guard will catch this on the next pass and try
-                    # fallback or bail with a clear message.
+                    # When Nous returns a 429 that is a genuine account-
+                    # level rate limit, record the reset time to a shared
+                    # file so ALL sessions (cron, gateway, auxiliary) know
+                    # not to pile on, then skip further retries -- each
+                    # one burns another RPH request and deepens the hole.
+                    # The retry loop's top-of-iteration guard will catch
+                    # this on the next pass and try fallback or bail.
+                    #
+                    # IMPORTANT: Nous Portal multiplexes multiple upstream
+                    # providers (DeepSeek, Kimi, MiMo, Hermes).  A 429 can
+                    # also mean an UPSTREAM provider is out of capacity
+                    # for one specific model -- transient, clears in
+                    # seconds, nothing to do with the caller's quota.
+                    # Tripping the cross-session breaker on that would
+                    # block every Nous model for minutes.  We use
+                    # ``is_genuine_nous_rate_limit`` to tell the two
+                    # apart via the 429's own x-ratelimit-* headers and
+                    # the last-known-good state captured on the previous
+                    # successful response.
                     if (
                         is_rate_limited
                         and self.provider == "nous"
                         and classified.reason == FailoverReason.rate_limit
                         and not recovered_with_pool
                     ):
+                        _genuine_nous_rate_limit = False
                         try:
-                            from agent.nous_rate_guard import record_nous_rate_limit
+                            from agent.nous_rate_guard import (
+                                is_genuine_nous_rate_limit,
+                                record_nous_rate_limit,
+                            )
                             _err_resp = getattr(api_error, "response", None)
                             _err_hdrs = (
                                 getattr(_err_resp, "headers", None)
                                 if _err_resp else None
                             )
-                            record_nous_rate_limit(
+                            _genuine_nous_rate_limit = is_genuine_nous_rate_limit(
                                 headers=_err_hdrs,
-                                error_context=error_context,
+                                last_known_state=self._rate_limit_state,
                             )
+                            if _genuine_nous_rate_limit:
+                                record_nous_rate_limit(
+                                    headers=_err_hdrs,
+                                    error_context=error_context,
+                                )
+                            else:
+                                logging.info(
+                                    "Nous 429 looks like upstream capacity "
+                                    "(no exhausted bucket in headers or "
+                                    "last-known state) -- not tripping "
+                                    "cross-session breaker."
+                                )
                         except Exception:
                             pass
-                        # Skip straight to max_retries — the top-of-loop
-                        # guard will handle fallback or bail cleanly.
-                        retry_count = max_retries
-                        continue
+                        if _genuine_nous_rate_limit:
+                            # Skip straight to max_retries -- the
+                            # top-of-loop guard will handle fallback or
+                            # bail cleanly.
+                            retry_count = max_retries
+                            continue
+                        # Upstream capacity 429: fall through to normal
+                        # retry logic.  A different model (or the same
+                        # model a moment later) will typically succeed.
 
                     is_payload_too_large = (
                         classified.reason == FailoverReason.payload_too_large
@@ -11528,16 +12139,26 @@ class AIAgent:
                     interim_has_content = bool((interim_msg.get("content") or "").strip())
                     interim_has_reasoning = bool(interim_msg.get("reasoning", "").strip()) if isinstance(interim_msg.get("reasoning"), str) else False
                     interim_has_codex_reasoning = bool(interim_msg.get("codex_reasoning_items"))
+                    interim_has_codex_message_items = bool(interim_msg.get("codex_message_items"))
 
-                    if interim_has_content or interim_has_reasoning or interim_has_codex_reasoning:
+                    if (
+                        interim_has_content
+                        or interim_has_reasoning
+                        or interim_has_codex_reasoning
+                        or interim_has_codex_message_items
+                    ):
                         last_msg = messages[-1] if messages else None
                         # Duplicate detection: two consecutive incomplete assistant
                         # messages with identical content AND reasoning are collapsed.
-                        # For reasoning-only messages (codex_reasoning_items differ but
-                        # visible content/reasoning are both empty), we also compare
-                        # the encrypted items to avoid silently dropping new state.
+                        # For provider-state-only changes (encrypted reasoning
+                        # items or replayable message ids/phases/statuses differ
+                        # while visible content/reasoning are unchanged), compare
+                        # those opaque payloads too so we don't silently drop the
+                        # newer continuation state.
                         last_codex_items = last_msg.get("codex_reasoning_items") if isinstance(last_msg, dict) else None
                         interim_codex_items = interim_msg.get("codex_reasoning_items")
+                        last_codex_message_items = last_msg.get("codex_message_items") if isinstance(last_msg, dict) else None
+                        interim_codex_message_items = interim_msg.get("codex_message_items")
                         duplicate_interim = (
                             isinstance(last_msg, dict)
                             and last_msg.get("role") == "assistant"
@@ -11545,6 +12166,7 @@ class AIAgent:
                             and (last_msg.get("content") or "") == (interim_msg.get("content") or "")
                             and (last_msg.get("reasoning") or "") == (interim_msg.get("reasoning") or "")
                             and last_codex_items == interim_codex_items
+                            and last_codex_message_items == interim_codex_message_items
                         )
                         if not duplicate_interim:
                             messages.append(interim_msg)
@@ -12147,7 +12769,6 @@ class AIAgent:
                         truncated_response_prefix = ""
                         length_continue_retries = 0
                     
-                    # Strip <think> blocks from user-facing response (keep raw in messages for trajectory)
                     final_response = self._strip_think_blocks(final_response).strip()
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)

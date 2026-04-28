@@ -46,6 +46,7 @@ _PROVIDER_ENV_HINTS = (
     "Z_AI_API_KEY",
     "KIMI_API_KEY",
     "KIMI_CN_API_KEY",
+    "GMI_API_KEY",
     "MINIMAX_API_KEY",
     "MINIMAX_CN_API_KEY",
     "KILOCODE_API_KEY",
@@ -320,7 +321,11 @@ def run_doctor(args):
                     known_providers.add("custom:" + name.lower().replace(" ", "-"))
 
             canonical_provider = provider
-            if provider and _resolve_provider_full is not None and provider != "auto":
+            if (
+                provider
+                and _resolve_provider_full is not None
+                and provider not in ("auto", "custom")
+            ):
                 provider_def = _resolve_provider_full(provider, user_providers, custom_providers)
                 canonical_provider = provider_def.id if provider_def is not None else None
 
@@ -933,6 +938,7 @@ def run_doctor(args):
         ("StepFun Step Plan",   ("STEPFUN_API_KEY",),                           "https://api.stepfun.ai/step_plan/v1/models", "STEPFUN_BASE_URL", True),
         ("Kimi / Moonshot (China)", ("KIMI_CN_API_KEY",),                    "https://api.moonshot.cn/v1/models",   None, True),
         ("Arcee AI",         ("ARCEEAI_API_KEY",),                            "https://api.arcee.ai/api/v1/models",  "ARCEE_BASE_URL", True),
+        ("GMI Cloud",        ("GMI_API_KEY",),                                "https://api.gmi-serving.com/v1/models", "GMI_BASE_URL", True),
         ("DeepSeek",         ("DEEPSEEK_API_KEY",),                           "https://api.deepseek.com/v1/models",  "DEEPSEEK_BASE_URL", True),
         ("Hugging Face",     ("HF_TOKEN",),                                   "https://router.huggingface.co/v1/models", "HF_BASE_URL", True),
         ("NVIDIA NIM",       ("NVIDIA_API_KEY",),                             "https://integrate.api.nvidia.com/v1/models", "NVIDIA_BASE_URL", True),

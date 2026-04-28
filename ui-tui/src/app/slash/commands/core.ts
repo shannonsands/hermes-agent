@@ -5,7 +5,9 @@ import { isSectionName, nextDetailsMode, parseDetailsMode, SECTION_NAMES } from 
 import type {
   ConfigGetValueResponse,
   ConfigSetResponse,
+  SessionSaveResponse,
   SessionSteerResponse,
+  SessionTitleResponse,
   SessionUndoResponse
 } from '../../../gatewayTypes.js'
 import { writeOsc52Clipboard } from '../../../lib/osc52.js'
@@ -151,6 +153,47 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
+    help: 'set or show current session title',
+    name: 'title',
+    run: (arg, ctx) => {
+      if (!ctx.sid) {
+        return ctx.transcript.sys('no active session')
+      }
+
+      const title = arg.trim()
+
+      if (!arg) {
+        ctx.gateway
+          .rpc<SessionTitleResponse>('session.title', { session_id: ctx.sid })
+          .then(
+            ctx.guarded<SessionTitleResponse>(r => {
+              const current = (r?.title ?? '').trim()
+              ctx.transcript.sys(current ? `title: ${current}` : 'no title set')
+            })
+          )
+          .catch(ctx.guardedErr)
+
+        return
+      }
+
+      if (!title) {
+        return ctx.transcript.sys('usage: /title <your session title>')
+      }
+
+      ctx.gateway
+        .rpc<SessionTitleResponse>('session.title', { session_id: ctx.sid, title })
+        .then(
+          ctx.guarded<SessionTitleResponse>(r => {
+            const next = (r?.title ?? title).trim()
+            const suffix = r?.pending ? ' (queued while session initializes)' : ''
+            ctx.transcript.sys(`session title set: ${next}${suffix}`)
+          })
+        )
+        .catch(ctx.guardedErr)
+    }
+  },
+
+  {
     help: 'toggle compact transcript',
     name: 'compact',
     run: (arg, ctx) => {
@@ -183,7 +226,7 @@ export const coreCommands: SlashCommand[] = [
             }
 
             const mode = parseDetailsMode(r?.value) ?? ui.detailsMode
-            patchUiState({ detailsMode: mode })
+            patchUiState({ detailsMode: mode, detailsModeCommandOverride: false })
 
             const overrides = SECTION_NAMES.filter(s => ui.sections[s])
               .map(s => `${s}=${ui.sections[s]}`)
@@ -223,7 +266,7 @@ export const coreCommands: SlashCommand[] = [
         return transcript.sys(DETAILS_USAGE)
       }
 
-      patchUiState({ detailsMode: next })
+      patchUiState({ detailsMode: next, detailsModeCommandOverride: true })
       gateway.rpc<ConfigSetResponse>('config.set', { key: 'details_mode', value: next }).catch(() => {})
       transcript.sys(`details: ${next}`)
     }
@@ -250,11 +293,19 @@ export const coreCommands: SlashCommand[] = [
   {
     help: 'copy selection or assistant message',
     name: 'copy',
-    run: (arg, ctx) => {
+    run: async (arg, ctx) => {
       const { sys } = ctx.transcript
 
-      if (!arg && ctx.composer.hasSelection && ctx.composer.selection.copySelection()) {
-        return sys('copied selection')
+      if (!arg && ctx.composer.hasSelection) {
+        const text = await ctx.composer.selection.copySelection()
+
+        if (text) {
+          return sys(`copied ${text.length} characters`)
+        } else {
+          return sys(
+            'clipboard copy failed — try HERMES_TUI_FORCE_OSC52=1 to force the escape sequence; HERMES_TUI_DEBUG_CLIPBOARD=1 for details'
+          )
+        }
       }
 
       if (arg && Number.isNaN(parseInt(arg, 10))) {
@@ -348,6 +399,39 @@ export const coreCommands: SlashCommand[] = [
       })
 
       ctx.transcript.page(lines.join('\n\n'), 'History')
+    }
+  },
+
+  {
+    help: 'save the current transcript to JSON',
+    name: 'save',
+    run: (_arg, ctx) => {
+      const hasConversation = ctx.local
+        .getHistoryItems()
+        .some(m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool')
+
+      if (!hasConversation) {
+        return ctx.transcript.sys('no conversation yet')
+      }
+
+      if (!ctx.sid) {
+        return ctx.transcript.sys('no active session — nothing to save')
+      }
+
+      ctx.gateway
+        .rpc<SessionSaveResponse>('session.save', { session_id: ctx.sid })
+        .then(
+          ctx.guarded<SessionSaveResponse>(r => {
+            const file = r?.file
+
+            if (file) {
+              ctx.transcript.sys(`conversation saved to: ${file}`)
+            } else {
+              ctx.transcript.sys('failed to save')
+            }
+          })
+        )
+        .catch(ctx.guardedErr)
     }
   },
 

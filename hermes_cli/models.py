@@ -33,8 +33,6 @@ COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("moonshotai/kimi-k2.6",            "recommended"),
-    ("deepseek/deepseek-v4-pro",        ""),
-    ("deepseek/deepseek-v4-flash",      ""),
     ("anthropic/claude-opus-4.7",       ""),
     ("anthropic/claude-opus-4.6",       ""),
     ("anthropic/claude-sonnet-4.6",     ""),
@@ -111,8 +109,6 @@ def _codex_curated_models() -> list[str]:
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "nous": [
         "moonshotai/kimi-k2.6",
-        "deepseek/deepseek-v4-pro",
-        "deepseek/deepseek-v4-flash",
         "xiaomi/mimo-v2.5-pro",
         "xiaomi/mimo-v2.5",
         "anthropic/claude-opus-4.7",
@@ -282,6 +278,14 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "trinity-large-preview",
         "trinity-mini",
     ],
+    "gmi": [
+        "zai-org/GLM-5.1-FP8",
+        "deepseek-ai/DeepSeek-V3.2",
+        "moonshotai/Kimi-K2.5",
+        "google/gemini-3.1-flash-lite-preview",
+        "anthropic/claude-sonnet-4.6",
+        "openai/gpt-5.4",
+    ],
     "opencode-zen": [
         "kimi-k2.5",
         "gpt-5.4-pro",
@@ -383,6 +387,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "us.meta.llama4-maverick-17b-instruct-v1:0",
         "us.meta.llama4-scout-17b-instruct-v1:0",
     ],
+    # Azure Foundry: user-provided endpoint and model.
+    # Empty list because models depend on the endpoint configuration.
+    "azure-foundry": [],
 }
 
 # Vercel AI Gateway: derive the bare-model-id catalog from the curated
@@ -710,7 +717,6 @@ class ProviderEntry(NamedTuple):
     label: str
     tui_desc: str   # detailed description for `hermes model` TUI
 
-
 CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("nous",           "Nous Portal",              "Nous Portal (Nous Research subscription)"),
     ProviderEntry("openrouter",     "OpenRouter",               "OpenRouter (100+ models, pay-per-use)"),
@@ -736,10 +742,12 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("alibaba",        "Alibaba Cloud (DashScope)","Alibaba Cloud / DashScope Coding (Qwen + multi-provider)"),
     ProviderEntry("ollama-cloud",   "Ollama Cloud",             "Ollama Cloud (cloud-hosted open models — ollama.com)"),
     ProviderEntry("arcee",          "Arcee AI",                 "Arcee AI (Trinity models — direct API)"),
+    ProviderEntry("gmi",            "GMI Cloud",                "GMI Cloud (multi-model direct API)"),
     ProviderEntry("kilocode",       "Kilo Code",                "Kilo Code (Kilo Gateway API)"),
     ProviderEntry("opencode-zen",   "OpenCode Zen",             "OpenCode Zen (35+ curated models, pay-as-you-go)"),
     ProviderEntry("opencode-go",    "OpenCode Go",              "OpenCode Go (open models, $10/month subscription)"),
     ProviderEntry("bedrock",        "AWS Bedrock",              "AWS Bedrock (Claude, Nova, Llama, DeepSeek — IAM or API key)"),
+    ProviderEntry("azure-foundry",  "Azure Foundry",            "Azure Foundry (OpenAI-style or Anthropic-style endpoint — your Azure AI deployment)"),
 ]
 
 # Derived dicts — used throughout the codebase
@@ -769,6 +777,8 @@ _PROVIDER_ALIASES = {
     "stepfun-coding-plan": "stepfun",
     "arcee-ai": "arcee",
     "arceeai": "arcee",
+    "gmi-cloud": "gmi",
+    "gmicloud": "gmi",
     "minimax-china": "minimax-cn",
     "minimax_cn": "minimax-cn",
     "claude": "anthropic",
@@ -872,7 +882,16 @@ def fetch_openrouter_models(
     if _openrouter_catalog_cache is not None and not force_refresh:
         return list(_openrouter_catalog_cache)
 
-    fallback = list(OPENROUTER_MODELS)
+    # Prefer the remotely-hosted catalog manifest; fall back to the in-repo
+    # snapshot when the manifest is unreachable. Both are curated lists that
+    # drive the picker; the OpenRouter live /v1/models filter (tool support,
+    # free pricing) is applied on top either way.
+    try:
+        from hermes_cli.model_catalog import get_curated_openrouter_models
+        remote = get_curated_openrouter_models()
+    except Exception:
+        remote = None
+    fallback = list(remote) if remote else list(OPENROUTER_MODELS)
     preferred_ids = [mid for mid, _ in fallback]
 
     try:
@@ -923,6 +942,24 @@ def fetch_openrouter_models(
 def model_ids(*, force_refresh: bool = False) -> list[str]:
     """Return just the OpenRouter model-id strings."""
     return [mid for mid, _ in fetch_openrouter_models(force_refresh=force_refresh)]
+
+
+def get_curated_nous_model_ids() -> list[str]:
+    """Return the curated Nous Portal model-id list.
+
+    Prefers the remotely-hosted catalog manifest (published under
+    ``website/static/api/model-catalog.json``); falls back to the in-repo
+    snapshot in ``_PROVIDER_MODELS["nous"]`` when the manifest is
+    unreachable. Always returns a list (never None).
+    """
+    try:
+        from hermes_cli.model_catalog import get_curated_nous_models
+        remote = get_curated_nous_models()
+    except Exception:
+        remote = None
+    if remote:
+        return list(remote)
+    return list(_PROVIDER_MODELS.get("nous", []))
 
 
 def _ai_gateway_model_is_free(pricing: Any) -> bool:
@@ -1822,6 +1859,19 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                     return live
             except Exception:
                 pass
+    if normalized == "gmi":
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+
+            creds = resolve_api_key_provider_credentials("gmi")
+            api_key = str(creds.get("api_key") or "").strip()
+            base_url = str(creds.get("base_url") or "").strip()
+            if api_key and base_url:
+                live = fetch_api_models(api_key, base_url)
+                if live:
+                    return live
+        except Exception:
+            pass
     if normalized == "custom":
         base_url = _get_custom_base_url()
         if base_url:
@@ -2197,6 +2247,52 @@ def copilot_model_api_mode(
                 return "anthropic_messages"
 
     return "chat_completions"
+
+
+# Azure Foundry model families that require the Responses API.  Azure
+# rejects /chat/completions against these deployments with
+# ``400 "The requested operation is unsupported."`` — the same payload Bob
+# Dobolina hit in April 2026 on ``gpt-5.3-codex`` while ``gpt-4o-pure`` on
+# the same endpoint worked fine.  Keep the patterns broad enough to cover
+# vendor-renamed deployments (e.g. ``gpt-5.3-codex``, ``gpt-5-codex``,
+# ``gpt-5.4``, ``o1-preview``) but tight enough to leave GPT-4 / 3.5 / Llama /
+# Mistral / Grok deployments on chat completions.
+_AZURE_FOUNDRY_RESPONSES_PREFIXES = (
+    "codex",       # codex-*, codex-mini
+    "gpt-5",       # gpt-5, gpt-5.x, gpt-5-codex, gpt-5.x-codex
+    "o1",          # o1, o1-preview, o1-mini
+    "o3",          # o3, o3-mini
+    "o4",          # o4, o4-mini
+)
+
+
+def azure_foundry_model_api_mode(model_name: Optional[str]) -> Optional[str]:
+    """Infer Azure Foundry api_mode from a deployment/model name.
+
+    Returns ``"codex_responses"`` when the model name matches a family that
+    only accepts the Responses API on Azure Foundry (GPT-5.x, codex, o1/o3/o4
+    reasoning models).  Returns ``None`` otherwise — the caller should fall
+    back to the configured/default api_mode (typically ``chat_completions``)
+    so GPT-4o, GPT-4 Turbo, Llama, Mistral, etc. keep working.
+
+    Intentionally does NOT return ``anthropic_messages``; Anthropic-style
+    Azure endpoints are disambiguated by URL (``/anthropic`` suffix) in
+    ``runtime_provider._detect_api_mode_for_url`` and by the user setting
+    ``model.api_mode: anthropic_messages`` explicitly.
+    """
+    raw = str(model_name or "").strip().lower()
+    if not raw:
+        return None
+    # Strip any vendor/ prefix a user may have copied from OpenRouter / Copilot.
+    if "/" in raw:
+        raw = raw.rsplit("/", 1)[-1]
+    # gpt-5-mini speaks chat completions on Copilot but Azure Foundry deploys
+    # the full gpt-5 family uniformly on Responses API — don't carve an
+    # exception here.
+    for prefix in _AZURE_FOUNDRY_RESPONSES_PREFIXES:
+        if raw.startswith(prefix):
+            return "codex_responses"
+    return None
 
 
 def normalize_opencode_model_id(provider_id: Optional[str], model_id: Optional[str]) -> str:
@@ -2622,8 +2718,8 @@ def validate_requested_model(
                 )
 
             return {
-                "accepted": False,
-                "persist": False,
+                "accepted": True,
+                "persist": True,
                 "recognized": False,
                 "message": message,
             }
