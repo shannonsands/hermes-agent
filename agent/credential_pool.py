@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 import threading
 import time
@@ -13,7 +14,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
-from hermes_cli.config import get_env_value
+from hermes_cli.config import get_env_value, load_env
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -1299,6 +1300,48 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         except Exception as exc:
             logger.debug("Qwen OAuth token seed failed: %s", exc)
 
+    elif provider == "minimax-oauth":
+        # MiniMax OAuth tokens live in ~/.hermes/auth.json providers.minimax-oauth.
+        # Seed the pool so `/auth list` reflects the logged-in state and the
+        # standard `hermes auth remove minimax-oauth <N>` flow works.
+        # Use refresh_if_expiring=False equivalent: resolve_minimax_oauth_runtime_credentials
+        # always refreshes on expiry, so instead read raw state here to avoid
+        # surprise network calls during provider discovery.
+        try:
+            from hermes_cli.auth import get_provider_auth_state
+            state = get_provider_auth_state("minimax-oauth")
+            if state and state.get("access_token"):
+                source_name = "oauth"
+                if not _is_suppressed(provider, source_name):
+                    active_sources.add(source_name)
+                    expires_at_ms = None
+                    try:
+                        from datetime import datetime as _dt
+                        raw = state.get("expires_at", "")
+                        if raw:
+                            expires_at_ms = int(_dt.fromisoformat(raw).timestamp() * 1000)
+                    except Exception:
+                        expires_at_ms = None
+                    base_url = str(state.get("inference_base_url", "") or "").rstrip("/")
+                    changed |= _upsert_entry(
+                        entries,
+                        provider,
+                        source_name,
+                        {
+                            "source": source_name,
+                            "auth_type": AUTH_TYPE_OAUTH,
+                            "access_token": state["access_token"],
+                            "refresh_token": state.get("refresh_token"),
+                            "expires_at_ms": expires_at_ms,
+                            "base_url": base_url,
+                            "label": state.get("label", "") or label_from_token(
+                                state.get("access_token", ""), source_name
+                            ),
+                        },
+                    )
+        except Exception as exc:
+            logger.debug("MiniMax OAuth token seed failed: %s", exc)
+
     elif provider == "openai-codex":
         # Respect user suppression — `hermes auth remove openai-codex` marks
         # the device_code source as suppressed so it won't be re-seeded from
@@ -1338,6 +1381,16 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
+
+    # Prefer ~/.hermes/.env over os.environ — the user's config file is the
+    # authoritative source for Hermes credentials. Stale env vars from parent
+    # processes (Codex CLI, test scripts, etc.) should not override deliberate
+    # changes to the .env file.
+    def _get_env_prefer_dotenv(key: str) -> str:
+        env_file = load_env()
+        val = env_file.get(key) or os.environ.get(key) or ""
+        return val.strip()
+
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it
     # won't be re-seeded from the user's shell environment or ~/.hermes/.env.
@@ -1349,8 +1402,8 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         def _is_source_suppressed(_p, _s):  # type: ignore[misc]
             return False
     if provider == "openrouter":
-        # Check both os.environ and ~/.hermes/.env file
-        token = (get_env_value("OPENROUTER_API_KEY") or "").strip()
+        # Prefer ~/.hermes/.env over os.environ
+        token = _get_env_prefer_dotenv("OPENROUTER_API_KEY")
         if token:
             source = "env:OPENROUTER_API_KEY"
             if _is_source_suppressed(provider, source):
@@ -1376,7 +1429,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = (get_env_value(pconfig.base_url_env_var) or "").strip().rstrip("/")
+        env_url = _get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
 
     env_vars = list(pconfig.api_key_env_vars)
     if provider == "anthropic":
@@ -1387,8 +1440,8 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         ]
 
     for env_var in env_vars:
-        # Check both os.environ and ~/.hermes/.env file
-        token = (get_env_value(env_var) or "").strip()
+        # Prefer ~/.hermes/.env over os.environ
+        token = _get_env_prefer_dotenv(env_var)
         if not token:
             continue
         source = f"env:{env_var}"

@@ -243,10 +243,14 @@ class QQAdapter(BasePlatformAdapter):
             return False
 
         try:
+            # Tighter keepalive pool so idle CLOSE_WAIT sockets drain
+            # faster behind proxies like Cloudflare Warp (#18451).
+            from gateway.platforms._http_client_limits import platform_httpx_limits
             self._http_client = httpx.AsyncClient(
                 timeout=30.0,
                 follow_redirects=True,
                 event_hooks={"response": [_ssrf_redirect_guard]},
+                limits=platform_httpx_limits(),
             )
 
             # 1. Get access token
@@ -976,6 +980,18 @@ class QQAdapter(BasePlatformAdapter):
         if not channel_id:
             return
 
+        # Apply group_policy ACL — guild channels are group-like contexts.
+        # Without this check any member of any guild the bot is in could
+        # bypass the configured allowlist.
+        guild_id = str(d.get("guild_id", ""))
+        author_id = str(author.get("id", ""))
+        if not self._is_group_allowed(guild_id or channel_id, author_id):
+            logger.debug(
+                "[%s] Guild message blocked by ACL: channel=%s user=%s",
+                self._log_tag, channel_id, author_id,
+            )
+            return
+
         member = d.get("member") if isinstance(d.get("member"), dict) else {}
         nick = str(member.get("nick", "")) or str(author.get("username", ""))
 
@@ -1030,6 +1046,17 @@ class QQAdapter(BasePlatformAdapter):
         """Handle a guild DM message event."""
         guild_id = str(d.get("guild_id", ""))
         if not guild_id:
+            return
+
+        # Apply dm_policy ACL — guild DMs were previously unauthenticated.
+        # Without this check any member of any guild the bot is in could
+        # bypass the configured allowlist via direct messages.
+        author_id = str(author.get("id", ""))
+        if not self._is_dm_allowed(author_id):
+            logger.debug(
+                "[%s] Guild DM blocked by ACL: guild=%s user=%s",
+                self._log_tag, guild_id, author_id,
+            )
             return
 
         text = content
