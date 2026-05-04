@@ -17,6 +17,7 @@ import type {
 import { useGitBranch } from '../hooks/useGitBranch.js'
 import { useVirtualHistory } from '../hooks/useVirtualHistory.js'
 import { appendTranscriptMessage } from '../lib/messages.js'
+import { composerPromptWidth } from '../lib/inputMetrics.js'
 import { isMac } from '../lib/platform.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
 import { terminalParityHints } from '../lib/terminalParity.js'
@@ -244,7 +245,8 @@ export function useMainApp(gw: GatewayClient) {
   }, [ui.detailsMode, ui.detailsModeCommandOverride, ui.sections])
 
   const detailsVisible = detailsLayoutKey !== 'hidden:hidden'
-  const heightCacheKey = `${ui.sid ?? 'draft'}:${cols}:${ui.compact ? '1' : '0'}:${detailsLayoutKey}`
+  const userPromptWidth = composerPromptWidth(ui.theme.brand.prompt)
+  const heightCacheKey = `${ui.sid ?? 'draft'}:${cols}:${userPromptWidth}:${ui.compact ? '1' : '0'}:${detailsLayoutKey}`
 
   const heightCache = useMemo(() => {
     let cache = heightCachesRef.current.get(heightCacheKey)
@@ -266,9 +268,10 @@ export function useMainApp(gw: GatewayClient) {
       estimatedMsgHeight(virtualRows[index]!.msg, cols, {
         compact: ui.compact,
         details: detailsVisible,
-        limitHistory: index < virtualRows.length - FULL_RENDER_TAIL_ITEMS
+        limitHistory: index < virtualRows.length - FULL_RENDER_TAIL_ITEMS,
+        userPrompt: ui.theme.brand.prompt
       }),
-    [cols, detailsVisible, ui.compact, virtualRows]
+    [cols, detailsVisible, ui.compact, ui.theme.brand.prompt, virtualRows]
   )
 
   const syncHeightCache = useCallback(
@@ -358,6 +361,13 @@ export function useMainApp(gw: GatewayClient) {
   const die = useCallback(() => {
     gw.kill()
     exit()
+    // Ink's exit() calls unmount() which resets terminal modes but does NOT
+    // call process.exit().  Without an explicit exit the Node process stays
+    // alive (stdin listener keeps the event loop open), so the process.on('exit')
+    // handler in entry.tsx — which sends the final resetTerminalModes() — never
+    // fires.  This leaves kitty keyboard protocol, mouse modes, etc. enabled
+    // in the parent shell.  See issue #19194.
+    process.exit(0)
   }, [exit, gw])
 
   const session = useSessionLifecycle({
