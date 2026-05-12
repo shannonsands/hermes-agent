@@ -105,11 +105,20 @@ def _build_document(raw, PolicyDocument, PolicyRule, PolicyCondition,
 
 
 def _coerce_action(value, PolicyAction):
-    """Accept str or PolicyAction member, return PolicyAction."""
+    """Accept str or PolicyAction member, return PolicyAction.
+
+    We extend AGT's enum vocabulary with one alias: ``review``. Since
+    AGT's PolicyAction is {ALLOW, DENY, AUDIT, BLOCK}, we map the
+    Hermes ``review`` keyword onto ``AUDIT`` — which AGT defines as
+    "let it through but flag it for inspection." The interceptor
+    treats AUDIT verdicts as "fall through to Hermes's existing
+    approval UX" (CLI prompt, gateway buttons, smart-mode aux LLM)
+    rather than auto-allowing.
+    """
     if hasattr(value, "value"):
         return value
     s = str(value).strip().upper().replace("-", "_")
-    # Map common aliases
+    # Map common aliases. REVIEW/PROMPT/WARN -> AUDIT (review-required).
     aliases = {"REVIEW": "AUDIT", "PROMPT": "AUDIT", "WARN": "AUDIT"}
     s = aliases.get(s, s)
     try:

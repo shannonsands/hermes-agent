@@ -104,7 +104,7 @@ rules:
       field: command
       operator: matches
       value: '\brm\s+(-[^\s]*r|--recursive\b)'
-    action: deny
+    action: review
 
   - name: mkfs-format
     priority: 175
@@ -160,7 +160,7 @@ rules:
       field: command
       operator: matches
       value: '\bfind\b.*-delete\b'
-    action: deny
+    action: review
 
   # `unlink` is the syscall-style file-removal command — easy to miss
   # because it doesn't share the `rm` prefix. Single-file unlink is
@@ -171,7 +171,7 @@ rules:
       field: command
       operator: matches
       value: '\bunlink\b'
-    action: deny
+    action: review
 
   # ─────────────────────────── Sensitive path writes ──────────────────────
   - name: redirect-overwrite-etc
@@ -279,7 +279,7 @@ rules:
       field: command
       operator: matches
       value: '\bgit\s+reset\s+--hard\b'
-    action: deny
+    action: review
 
   - name: git-force-push
     priority: 90
@@ -287,7 +287,7 @@ rules:
       field: command
       operator: matches
       value: '\bgit\s+push\b.*(--force\b|-f\b)'
-    action: deny
+    action: review
 
   - name: git-clean-force
     priority: 90
@@ -295,7 +295,7 @@ rules:
       field: command
       operator: matches
       value: '\bgit\s+clean\s+-[^\s]*f'
-    action: deny
+    action: review
 
   - name: git-branch-force-delete
     priority: 90
@@ -303,7 +303,7 @@ rules:
       field: command
       operator: matches
       value: '\bgit\s+branch\s+-D\b'
-    action: deny
+    action: review
 
   # ─────────────────────────── Process kills ──────────────────────────────
   - name: systemctl-stop-restart

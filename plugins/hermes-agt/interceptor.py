@@ -114,11 +114,15 @@ class HermesGovernanceInterceptor:
         matched = getattr(result, "matched_rule", None) or getattr(result, "rule", None)
         allowed = bool(getattr(result, "allowed", action_str in ("allow", "audit")))
 
+        # AUDIT verdict means "review required" — the policy author wrote
+        # `action: review` (or `audit` directly) and wants a human to
+        # approve before the call runs.
+        is_review = action_str == "audit"
+
         # Trust handling: if trust below threshold, force review on this call
-        # by treating it as a blocked-and-deferred case. For now, the PoC just
-        # logs it — wiring into the Hermes approval UX comes in Phase C.
+        # even when the rule itself said allow.
         forced_review = False
-        if self.trust_enabled and allowed and self.trust.below_threshold(session_id):
+        if self.trust_enabled and allowed and not is_review and self.trust.below_threshold(session_id):
             forced_review = True
 
         audit_bridge.write_decision(
@@ -127,21 +131,141 @@ class HermesGovernanceInterceptor:
             decision=action_str,
             matched_rule=matched,
             context=ctx,
-            requires_review=forced_review,
+            requires_review=is_review or forced_review,
             trust_score=self.trust.get(session_id) if self.trust_enabled else None,
         )
 
         if not allowed:
-            # Deny path
+            # Hard deny path
             if self.trust_enabled:
                 self.trust.penalize(session_id)
             reason = f"hermes-agt: denied by policy '{matched or 'default'}' " \
                      f"(rule action={action_str})"
             return {"action": "block", "message": reason}
 
-        # Allow / audit path — let Hermes continue. If forced_review, the
-        # tool runs but we've audit-logged the trust gate.
+        # Review path: rule fired with `audit`/`review` action, OR trust
+        # dropped below threshold on a normally-allowed call. Hand off to
+        # Hermes's existing approval UX.
+        if is_review or forced_review:
+            return self._handle_review(
+                tool_name=tool_name,
+                ctx=ctx,
+                matched_rule=matched or "trust-floor",
+                correlation=correlation,
+                session_id=session_id,
+                forced_by_trust=forced_review,
+            )
+
+        # Plain allow path
         return None
+
+    def _handle_review(self, *, tool_name: str, ctx: Dict[str, Any],
+                       matched_rule: str, correlation: str,
+                       session_id: str, forced_by_trust: bool) -> Optional[Dict[str, Any]]:
+        """Prompt the user (CLI or gateway) to approve a review-flagged call.
+
+        Honors per-session and permanent allowlists keyed on the matched
+        rule name, so a 'session' or 'always' choice doesn't re-prompt for
+        the same rule on subsequent calls.
+        """
+        # Per-session and permanent allowlists, keyed on matched_rule.
+        # We use the rule name itself as the approval pattern_key so multiple
+        # tools tripping the same rule share an approval.
+        try:
+            from tools.approval import (
+                is_approved, approve_session, approve_permanent,
+                prompt_dangerous_approval, get_current_session_key,
+            )
+        except Exception as exc:
+            # Hermes approval module not importable from this context
+            # (standalone smoke runs, certain test paths). Fall back to
+            # treating review as allow + trust-penalty — better than
+            # blocking outright when the UX isn't reachable.
+            logger.debug("hermes-agt: approval module unavailable (%s); "
+                         "letting review-flagged call through with trust penalty", exc)
+            if self.trust_enabled:
+                self.trust.adjust(session_id, -0.05)
+            return None
+
+        approval_key = matched_rule
+        sess_key = get_current_session_key(default=session_id or "default")
+
+        if is_approved(sess_key, approval_key):
+            audit_bridge.write_approval_resolution(
+                correlation=correlation,
+                tool_name=tool_name,
+                surface="cached",
+                choice="session-allowlisted",
+            )
+            return None
+
+        # Build a human-readable description for the prompt.
+        cmd_or_path = (ctx.get("command") or ctx.get("path") or
+                       ctx.get("code_first_line") or tool_name)
+        if forced_by_trust:
+            description = (f"trust score below threshold "
+                           f"({self.trust.get(session_id):.2f}); "
+                           f"reviewing {tool_name} call")
+        else:
+            description = f"AGT policy '{matched_rule}' requires human review"
+
+        # Resolve the approval-callback registered by the active CLI / gateway.
+        approval_callback = None
+        try:
+            from tools.terminal_tool import _approval_callback as _term_cb
+            approval_callback = _term_cb
+        except Exception:
+            pass
+
+        # Test/automation override: HERMES_AGT_AUTO_APPROVE = "once" / "session"
+        # / "always" / "deny" forces the response without prompting. Used by
+        # the smoke test, automated demos, and CI runs that need
+        # deterministic behavior.
+        _override = os.environ.get("HERMES_AGT_AUTO_APPROVE", "").strip().lower()
+        if _override in {"once", "session", "always", "deny"}:
+            choice = _override
+        else:
+            try:
+                choice = prompt_dangerous_approval(
+                    command=str(cmd_or_path),
+                    description=description,
+                    allow_permanent=True,
+                    approval_callback=approval_callback,
+                )
+            except Exception as exc:
+                logger.warning("hermes-agt: approval prompt failed: %s", exc)
+                choice = "deny"
+
+        audit_bridge.write_approval_resolution(
+            correlation=correlation,
+            tool_name=tool_name,
+            surface="cli",
+            choice=choice,
+        )
+
+        if choice in {"once"}:
+            return None  # let through, will re-prompt next time
+        if choice == "session":
+            try:
+                approve_session(sess_key, approval_key)
+            except Exception:
+                pass
+            return None
+        if choice == "always":
+            try:
+                approve_permanent(approval_key)
+            except Exception:
+                pass
+            return None
+
+        # deny / timeout / unknown
+        if self.trust_enabled:
+            self.trust.penalize(session_id)
+        return {
+            "action": "block",
+            "message": f"hermes-agt: review denied for policy "
+                       f"'{matched_rule}' (user choice={choice})",
+        }
 
     def on_post_tool_call(self, *, tool_name: str = "", args: Any = None,
                           result: Any = None, task_id: str = "",

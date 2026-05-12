@@ -100,7 +100,51 @@ PoC. Pending official Microsoft partnership. See `~/.hermes/plans/2026-05-12_010
    accumulate. In interactive sessions trust is properly keyed by
    session.
 
-3. **`requires_review` not yet wired to Hermes approval UX.** The
-   interceptor records when trust falls below threshold, but doesn't
-   currently force the call into Hermes's approval prompt. Phase C.9
-   write-up calls this out as next.
+## Three policy verdicts: allow, deny, review
+
+Beyond AGT's binary `allow` / `deny`, this plugin recognizes a third
+keyword in YAML rules: `action: review`. Internally this maps to AGT's
+existing `AUDIT` PolicyAction (which means "let it through but flag
+it for inspection") and is detected by the interceptor as "needs human
+approval before the tool actually runs."
+
+When a `review` rule fires:
+
+1. The interceptor checks the per-session allowlist for the matched
+   rule name. If the user previously chose `session` or `always` for
+   the same rule, the call is auto-allowed — no re-prompt.
+2. Otherwise, `tools.approval.prompt_dangerous_approval(...)` runs the
+   standard Hermes approval UX (CLI prompt, gateway buttons, smart
+   mode aux LLM — whichever is wired for the active session).
+3. User choices map cleanly:
+   - `once`     → call runs, no allowlist update.
+   - `session`  → call runs, rule allowlisted for the session.
+   - `always`   → call runs, rule permanent-allowlisted.
+   - `deny`/`timeout` → block returned, trust penalized.
+
+### Default-policy rules that use `review`
+
+The bundled `policies/default.yaml` flips seven rules from `deny` to
+`review` because they have legitimate use cases the user typically
+wants to approve case-by-case:
+
+- `rm-recursive`         (delete build artifacts in dev)
+- `find-delete`          (cleanup scripts)
+- `unlink-file`          (remove single files)
+- `git-reset-hard`       (rewinding mistaken commits)
+- `git-force-push`       (rebasing PRs)
+- `git-clean-force`      (clean working tree)
+- `git-branch-force-delete` (delete unmerged branches)
+
+The hardline rules (`mkfs`, `dd if=`, fork bomb, `pkill hermes`,
+sudo with stdin/askpass, write to `/etc`, SQL drop, gateway
+self-stop) stay `deny` — there's never a legitimate reason an agent
+needs to approve them.
+
+### Test/automation override
+
+For deterministic tests and demos that need to bypass the interactive
+prompt, set `HERMES_AGT_AUTO_APPROVE` to one of `once` / `session` /
+`always` / `deny`. The interceptor honors this env var and skips the
+prompt entirely. Used by the bundled `scripts/smoke.py` and the demo
+script in the AGT examples PR.
