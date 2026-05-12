@@ -1,0 +1,348 @@
+# hermes-agt: default policy
+#
+# This policy is a faithful translation of Hermes Agent's built-in
+# DANGEROUS_PATTERNS list (tools/approval.py) into Microsoft AGT's
+# declarative YAML schema. Installing the plugin with this policy
+# produces approval/deny behavior equivalent to stock Hermes — but
+# under deterministic policy evaluation, with Merkle-chained audit,
+# and with policy-as-code that can be edited, versioned, signed, and
+# distributed.
+#
+# Rule priorities use a rough scheme:
+#   200+   : self-protection (don't kill our own gateway / hermes process)
+#   180-199: privilege escalation (sudo flags)
+#   160-179: filesystem destruction (rm, mkfs, dd, fork bombs)
+#   140-159: write to sensitive paths (/etc, project env files)
+#   120-139: SQL destruction
+#   100-119: shell-via-flag / pipe-to-shell
+#    80- 99: git destructive ops
+#    60- 79: process kills
+#    40- 59: chmod / chown to dangerous values
+#    20- 39: misc
+#
+# Edit ~/.hermes/policies/default.yaml (or drop additional *.yaml files
+# alongside it) to customise. Higher priority wins; defaults.action is
+# the verdict when no rule matches.
+
+name: hermes-default
+version: "1.0"
+
+defaults:
+  action: allow
+
+rules:
+  # ─────────────────────────── Self-protection ────────────────────────────
+  - name: hermes-gateway-stop-restart
+    priority: 220
+    condition:
+      field: command
+      operator: matches
+      value: '\bhermes\s+gateway\s+(stop|restart)\b'
+    action: deny
+
+  - name: hermes-update
+    priority: 220
+    condition:
+      field: command
+      operator: matches
+      value: '\bhermes\s+update\b'
+    action: deny
+
+  - name: gateway-run-outside-systemd
+    priority: 215
+    condition:
+      field: command
+      operator: matches
+      value: '(gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b))|(\bnohup\b.*gateway\s+run\b)'
+    action: deny
+
+  - name: pkill-killall-hermes
+    priority: 210
+    condition:
+      field: command
+      operator: matches
+      value: '\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b'
+    action: deny
+
+  - name: kill-pgrep-hermes
+    priority: 210
+    condition:
+      field: command
+      operator: matches
+      value: '\bkill\b.*(\$\(\s*pgrep\b|`\s*pgrep\b)'
+    action: deny
+
+  # ─────────────────────────── Privilege escalation ───────────────────────
+  - name: sudo-stdin-askpass-shell-list
+    priority: 190
+    condition:
+      field: command
+      operator: matches
+      value: '\bsudo\b[^;|&\n]*?\s+(?:-s\b|--stdin\b|-a\b|--askpass\b)'
+    action: deny
+
+  - name: sudo-combined-flags
+    priority: 190
+    condition:
+      field: command
+      operator: matches
+      value: '\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b'
+    action: deny
+
+  # ─────────────────────────── Filesystem destruction ─────────────────────
+  - name: rm-root-path
+    priority: 175
+    condition:
+      field: command
+      operator: matches
+      value: '\brm\s+(-[^\s]*\s+)*/'
+    action: deny
+
+  - name: rm-recursive
+    priority: 170
+    condition:
+      field: command
+      operator: matches
+      value: '\brm\s+(-[^\s]*r|--recursive\b)'
+    action: deny
+
+  - name: mkfs-format
+    priority: 175
+    condition:
+      field: command
+      operator: matches
+      value: '\bmkfs\b'
+    action: deny
+
+  - name: dd-disk-copy
+    priority: 175
+    condition:
+      field: command
+      operator: matches
+      value: '\bdd\s+.*if='
+    action: deny
+
+  - name: write-block-device
+    priority: 175
+    condition:
+      field: command
+      operator: matches
+      value: '>\s*/dev/sd'
+    action: deny
+
+  - name: fork-bomb
+    priority: 175
+    condition:
+      field: command
+      operator: matches
+      value: ':\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:'
+    action: deny
+
+  - name: xargs-rm
+    priority: 165
+    condition:
+      field: command
+      operator: matches
+      value: '\bxargs\s+.*\brm\b'
+    action: deny
+
+  - name: find-exec-rm
+    priority: 165
+    condition:
+      field: command
+      operator: matches
+      value: '\bfind\b.*-exec\s+(/\S*/)?rm\b'
+    action: deny
+
+  - name: find-delete
+    priority: 165
+    condition:
+      field: command
+      operator: matches
+      value: '\bfind\b.*-delete\b'
+    action: deny
+
+  # `unlink` is the syscall-style file-removal command — easy to miss
+  # because it doesn't share the `rm` prefix. Single-file unlink is
+  # equivalent to `rm <file>`, so we treat it the same way.
+  - name: unlink-file
+    priority: 165
+    condition:
+      field: command
+      operator: matches
+      value: '\bunlink\b'
+    action: deny
+
+  # ─────────────────────────── Sensitive path writes ──────────────────────
+  - name: redirect-overwrite-etc
+    priority: 150
+    condition:
+      field: command
+      operator: matches
+      value: '>\s*/etc/'
+    action: deny
+
+  - name: cp-mv-into-etc
+    priority: 150
+    condition:
+      field: command
+      operator: matches
+      value: '\b(cp|mv|install)\b.*\s/etc/'
+    action: deny
+
+  - name: sed-inplace-etc
+    priority: 150
+    condition:
+      field: command
+      operator: matches
+      value: '\bsed\s+(-[^\s]*i|--in-place\b).*\s/etc/'
+    action: deny
+
+  # ─────────────────────────── SQL destruction ────────────────────────────
+  - name: sql-drop
+    priority: 130
+    condition:
+      field: command
+      operator: matches
+      value: '\bDROP\s+(TABLE|DATABASE)\b'
+    action: deny
+
+  - name: sql-delete-no-where
+    priority: 130
+    condition:
+      field: command
+      operator: matches
+      value: '\bDELETE\s+FROM\b(?!.*\bWHERE\b)'
+    action: deny
+
+  - name: sql-truncate
+    priority: 130
+    condition:
+      field: command
+      operator: matches
+      value: '\bTRUNCATE\s+(TABLE)?\s*\w'
+    action: deny
+
+  # ─────────────────────────── Shell-via-flag / pipe-to-shell ─────────────
+  - name: shell-dash-c
+    priority: 110
+    condition:
+      field: command
+      operator: matches
+      value: '\b(bash|sh|zsh|ksh)\s+-[^\s]*c(\s+|$)'
+    action: deny
+
+  - name: script-dash-e-c
+    priority: 110
+    condition:
+      field: command
+      operator: matches
+      value: '\b(python[23]?|perl|ruby|node)\s+-[ec]\s+'
+    action: deny
+
+  - name: script-heredoc
+    priority: 110
+    condition:
+      field: command
+      operator: matches
+      value: '\b(python[23]?|perl|ruby|node)\s+<<'
+    action: deny
+
+  - name: pipe-remote-to-shell
+    priority: 110
+    condition:
+      field: command
+      operator: matches
+      value: '\b(curl|wget)\b.*\|\s*(ba)?sh\b'
+    action: deny
+
+  - name: shell-process-substitution-remote
+    priority: 110
+    condition:
+      field: command
+      operator: matches
+      value: '\b(bash|sh|zsh|ksh)\s+<\s*<?\s*\(\s*(curl|wget)\b'
+    action: deny
+
+  - name: chmod-then-exec
+    priority: 105
+    condition:
+      field: command
+      operator: matches
+      value: '\bchmod\s+\+x\b.*[;&|]+\s*\./'
+    action: deny
+
+  # ─────────────────────────── git destructive ────────────────────────────
+  - name: git-reset-hard
+    priority: 90
+    condition:
+      field: command
+      operator: matches
+      value: '\bgit\s+reset\s+--hard\b'
+    action: deny
+
+  - name: git-force-push
+    priority: 90
+    condition:
+      field: command
+      operator: matches
+      value: '\bgit\s+push\b.*(--force\b|-f\b)'
+    action: deny
+
+  - name: git-clean-force
+    priority: 90
+    condition:
+      field: command
+      operator: matches
+      value: '\bgit\s+clean\s+-[^\s]*f'
+    action: deny
+
+  - name: git-branch-force-delete
+    priority: 90
+    condition:
+      field: command
+      operator: matches
+      value: '\bgit\s+branch\s+-D\b'
+    action: deny
+
+  # ─────────────────────────── Process kills ──────────────────────────────
+  - name: systemctl-stop-restart
+    priority: 70
+    condition:
+      field: command
+      operator: matches
+      value: '\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b'
+    action: deny
+
+  - name: kill-all-processes
+    priority: 70
+    condition:
+      field: command
+      operator: matches
+      value: '\bkill\s+-9\s+-1\b'
+    action: deny
+
+  - name: pkill-9
+    priority: 70
+    condition:
+      field: command
+      operator: matches
+      value: '\bpkill\s+-9\b'
+    action: deny
+
+  # ─────────────────────────── Permissions / ownership ────────────────────
+  - name: chmod-world-writable
+    priority: 50
+    condition:
+      field: command
+      operator: matches
+      value: '\bchmod\s+(-[^\s]*\s+|--recursive\b.*)?(777|666|o\+[rwx]*w|a\+[rwx]*w)\b'
+    action: deny
+
+  - name: chown-recursive-root
+    priority: 50
+    condition:
+      field: command
+      operator: matches
+      value: '\bchown\s+(-[^\s]*R|--recursive\b).*root'
+    action: deny

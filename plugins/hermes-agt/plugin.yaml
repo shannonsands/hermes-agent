@@ -1,0 +1,12 @@
+name: hermes-agt
+version: "0.1.0"
+description: "Microsoft Agent Governance Toolkit (AGT) integration for Hermes. Routes every tool call through AGT's PolicyEvaluator before execution, dual-writes decisions to AGT's Merkle AuditLog and Hermes's agent.log, and reuses Hermes's existing approval UX for human-in-the-loop review. Install AGT into the Hermes venv with: uv pip install --python <hermes-venv-python> 'agent-governance-toolkit[full]'"
+author: NousResearch (PoC, pending Microsoft partnership)
+requires_env: []
+hooks:
+  - pre_tool_call
+  - post_tool_call
+  - pre_approval_request
+  - post_approval_response
+  - on_session_start
+  - on_session_end
