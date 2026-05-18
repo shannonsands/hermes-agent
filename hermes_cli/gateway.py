@@ -5,12 +5,15 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import textwrap
+import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -4239,6 +4242,201 @@ def gateway_setup():
 
 
 # =============================================================================
+# Hermes Flow Sidecar Management
+# =============================================================================
+
+def _flow_root() -> Path:
+    from hermes_constants import get_default_hermes_root
+    root = get_default_hermes_root() / "flow"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _flow_state_path() -> Path:
+    return _flow_root() / "flow_state.json"
+
+
+def _flow_log_path() -> Path:
+    root = _flow_root().parent / "logs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "flow.log"
+
+
+def _read_flow_state() -> dict:
+    try:
+        return json.loads(_flow_state_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_flow_state(state: dict) -> None:
+    _flow_state_path().write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _pid_running(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _flow_health_url(host: str, port: int) -> str:
+    return f"http://{host}:{int(port)}/flow/health"
+
+
+def _probe_flow(host: str, port: int, timeout: float = 1.0) -> tuple[bool, str]:
+    url = _flow_health_url(host, port)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            if response.status < 400:
+                return True, url
+            return False, f"{url} returned HTTP {response.status}"
+    except Exception as exc:
+        return False, f"{url} is not responding: {exc}"
+
+
+def _wait_for_flow(host: str, port: int, *, seconds: float = 8.0) -> tuple[bool, str]:
+    deadline = time.time() + seconds
+    last = ""
+    while time.time() < deadline:
+        ok, detail = _probe_flow(host, port, timeout=0.7)
+        if ok:
+            return True, detail
+        last = detail
+        time.sleep(0.25)
+    return False, last
+
+
+def _stop_flow_pid(pid: int | None) -> bool:
+    if not _pid_running(pid):
+        return False
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except OSError:
+        return False
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if not _pid_running(pid):
+            return True
+        time.sleep(0.15)
+    try:
+        os.kill(int(pid), signal.SIGKILL)
+    except OSError:
+        return True
+    return True
+
+
+def _flow_enable(host: str, port: int) -> None:
+    state = _read_flow_state()
+    old_pid = int(state.get("pid") or 0)
+    if _pid_running(old_pid):
+        ok, detail = _probe_flow(state.get("host", host), int(state.get("port") or port))
+        if ok:
+            print_success(f"Hermes Flow already running: {state.get('url') or detail}")
+            print_info(f"Log: {state.get('log') or _flow_log_path()}")
+            return
+        _stop_flow_pid(old_pid)
+
+    log_path = _flow_log_path()
+    env = os.environ.copy()
+    env.setdefault("HERMES_FLOW_HOST", host)
+    env.setdefault("HERMES_FLOW_PORT", str(port))
+    env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    cmd = [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "plugins.flow.server:app",
+        "--host",
+        host,
+        "--port",
+        str(int(port)),
+    ]
+    with log_path.open("ab") as log_f:
+        log_f.write(f"\n--- hermes gateway flow enable {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    url = f"http://{host}:{int(port)}"
+    state = {
+        "enabled": True,
+        "host": host,
+        "port": int(port),
+        "pid": proc.pid,
+        "url": url,
+        "log": str(log_path),
+        "started_at": time.time(),
+    }
+    _write_flow_state(state)
+    ok, detail = _wait_for_flow(host, int(port))
+    if ok:
+        print_success(f"Hermes Flow enabled: {url}")
+        print_info(f"Log: {log_path}")
+        return
+    print_warning(f"Hermes Flow process started but health check failed: {detail}")
+    print_info(f"Log: {log_path}")
+
+
+def _flow_disable() -> None:
+    state = _read_flow_state()
+    pid = int(state.get("pid") or 0)
+    stopped = _stop_flow_pid(pid)
+    state["enabled"] = False
+    state["stopped_at"] = time.time()
+    _write_flow_state(state)
+    if stopped:
+        print_success("Hermes Flow stopped")
+    else:
+        print_info("Hermes Flow was not running")
+
+
+def _flow_status(host: str, port: int) -> None:
+    state = _read_flow_state()
+    pid = int(state.get("pid") or 0)
+    state_host = state.get("host") or host
+    state_port = int(state.get("port") or port)
+    running = _pid_running(pid)
+    ok, detail = _probe_flow(state_host, state_port)
+    if running and ok:
+        print_success(f"Hermes Flow is running: {state.get('url') or f'http://{state_host}:{state_port}'}")
+    elif running:
+        print_warning(f"Hermes Flow process is running (PID {pid}) but health is failing")
+        print_info(detail)
+    else:
+        print_info("Hermes Flow is stopped")
+    if state.get("log"):
+        print_info(f"Log: {state['log']}")
+    print_info(f"DB: {_flow_root() / 'flow.db'}")
+
+
+def flow_gateway_command(args) -> None:
+    action = getattr(args, "flow_command", None) or "status"
+    host = getattr(args, "host", "127.0.0.1")
+    port = int(getattr(args, "port", 9120))
+    if action == "enable":
+        _flow_enable(host, port)
+    elif action == "disable":
+        _flow_disable()
+    elif action == "restart":
+        _flow_disable()
+        _flow_enable(host, port)
+    elif action == "status":
+        _flow_status(host, port)
+    else:
+        print_error(f"Unknown flow command: {action}")
+        sys.exit(2)
+
+
+# =============================================================================
 # Main Command Handler
 # =============================================================================
 
@@ -4268,6 +4466,10 @@ def _gateway_command_inner(args):
 
     if subcmd == "setup":
         gateway_setup()
+        return
+
+    if subcmd == "flow":
+        flow_gateway_command(args)
         return
 
     # Service management commands

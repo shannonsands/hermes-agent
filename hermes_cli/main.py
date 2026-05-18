@@ -8360,6 +8360,39 @@ def main():
         help="Target the Linux system-level gateway service",
     )
 
+    # gateway flow
+    gateway_flow = gateway_subparsers.add_parser(
+        "flow",
+        help="Manage the Hermes Flow sidecar",
+        description=(
+            "Manage the Hermes Flow FastAPI sidecar used by the native Flow "
+            "desktop shell."
+        ),
+    )
+    gateway_flow_subparsers = gateway_flow.add_subparsers(dest="flow_command")
+
+    def _add_flow_bind_args(parser):
+        parser.add_argument(
+            "--host",
+            default="127.0.0.1",
+            help="Host to bind the Flow sidecar to (default: 127.0.0.1)",
+        )
+        parser.add_argument(
+            "--port",
+            type=int,
+            default=9120,
+            help="Port to bind the Flow sidecar to (default: 9120)",
+        )
+
+    for _name, _help in [
+        ("enable", "Start the Hermes Flow sidecar"),
+        ("disable", "Stop the Hermes Flow sidecar"),
+        ("status", "Show Hermes Flow sidecar status"),
+        ("restart", "Restart the Hermes Flow sidecar"),
+    ]:
+        _flow_cmd = gateway_flow_subparsers.add_parser(_name, help=_help)
+        _add_flow_bind_args(_flow_cmd)
+
     # gateway install
     gateway_install = gateway_subparsers.add_parser(
         "install", help="Install gateway as a systemd/launchd background service"
