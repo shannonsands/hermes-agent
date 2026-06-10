@@ -141,7 +141,7 @@ export default function SkillsPage() {
       })
       .catch(() => showToast(t.common.loading, "error"))
       .finally(() => setLoading(false));
-  }, []);
+  }, [showToast, t.common.loading]);
 
   /* ---- Toggle skill ---- */
   const handleToggleSkill = async (skill: SkillInfo) => {
@@ -666,6 +666,13 @@ const SEVERITY_TONE: Record<string, "destructive" | "warning" | "secondary" | "o
   low: "secondary",
 };
 
+const SKILL_HUB_SEARCH_TIMEOUT_MS = 35_000;
+
+function describeHubError(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return String(error || "Unknown error");
+}
+
 function HubBrowser({
   showToast,
 }: {
@@ -678,11 +685,13 @@ function HubBrowser({
   const [sourceCounts, setSourceCounts] = useState<Record<string, number>>({});
   const [timedOut, setTimedOut] = useState<string[]>([]);
   const [searchMs, setSearchMs] = useState<number | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
 
   // Landing state: which hubs are wired up + featured skills.
   const [sources, setSources] = useState<SkillHubSource[]>([]);
   const [featured, setFeatured] = useState<SkillHubResult[]>([]);
   const [sourcesLoading, setSourcesLoading] = useState(true);
+  const [sourcesError, setSourcesError] = useState<string | null>(null);
 
   // identifier -> installed entry (drives "Installed" badges).
   const [installed, setInstalled] = useState<Record<string, SkillHubInstalledEntry>>({});
@@ -705,9 +714,10 @@ function HubBrowser({
         setSources(r.sources);
         setFeatured(r.featured);
         setInstalled(r.installed);
+        setSourcesError(null);
       })
-      .catch(() => {
-        /* leave landing minimal on failure */
+      .catch((e) => {
+        if (!cancelled) setSourcesError(describeHubError(e));
       })
       .finally(() => {
         if (!cancelled) setSourcesLoading(false);
@@ -723,19 +733,33 @@ function HubBrowser({
     if (!q) return;
     setSearching(true);
     setSearched(true);
+    setSearchError(null);
     const t0 = performance.now();
+    const controller = new AbortController();
+    let clientTimedOut = false;
+    const timer = window.setTimeout(() => {
+      clientTimedOut = true;
+      controller.abort();
+    }, SKILL_HUB_SEARCH_TIMEOUT_MS);
     try {
-      const r = await api.searchSkillsHub(q);
+      const r = await api.searchSkillsHub(q, "all", 20, {
+        signal: controller.signal,
+      });
       setResults(r.results);
       setSourceCounts(r.source_counts || {});
       setTimedOut(r.timed_out || []);
       setInstalled((prev) => ({ ...prev, ...(r.installed || {}) }));
     } catch (e) {
-      showToast(`Hub search failed: ${e}`, "error");
+      const message = clientTimedOut
+        ? `Hub search timed out after ${SKILL_HUB_SEARCH_TIMEOUT_MS / 1000}s. Try again or use a more specific query.`
+        : `Hub search failed: ${describeHubError(e)}`;
+      setSearchError(message);
+      showToast(message, "error");
       setResults([]);
       setSourceCounts({});
       setTimedOut([]);
     } finally {
+      window.clearTimeout(timer);
       setSearchMs(Math.round(performance.now() - t0));
       setSearching(false);
     }
@@ -844,7 +868,11 @@ function HubBrowser({
           </div>
 
           {/* Connected hubs strip — proves the tab is wired up. */}
-          <ConnectedHubs sources={sources} loading={sourcesLoading} />
+          <ConnectedHubs
+            sources={sources}
+            loading={sourcesLoading}
+            error={sourcesError}
+          />
         </CardContent>
       </Card>
 
@@ -934,7 +962,17 @@ function HubBrowser({
             timedOut={timedOut}
             ms={searchMs}
           />
-          {results.length === 0 ? (
+          {searchError && (
+            <Card className="rounded-none border-amber-400/50">
+              <CardContent className="py-3 text-sm text-amber-200">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>{searchError}</span>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+          {results.length === 0 && !searchError ? (
             <Card className="rounded-none">
               <CardContent className="py-8 text-center text-sm text-muted-foreground">
                 No matching skills found in the hub.
@@ -957,6 +995,7 @@ function HubBrowser({
       {/* ── Detail dialog: preview + scan ── */}
       {detail && (
         <SkillDetailDialog
+          key={detail.identifier}
           result={detail}
           installed={isInstalled(detail.identifier)}
           onClose={() => setDetail(null)}
@@ -972,9 +1011,11 @@ function HubBrowser({
 function ConnectedHubs({
   sources,
   loading,
+  error,
 }: {
   sources: SkillHubSource[];
   loading: boolean;
+  error: string | null;
 }) {
   if (loading) {
     return (
@@ -984,39 +1025,59 @@ function ConnectedHubs({
   if (sources.length === 0) {
     return (
       <p className="text-xs text-muted-foreground">
-        Results come from the same sources as{" "}
-        <span className="font-mono">hermes skills search</span>.
+        {error ? (
+          <>
+            Skill hub sources unavailable:{" "}
+            <span className="font-mono">{error}</span>
+          </>
+        ) : (
+          <>
+            Results come from the same sources as{" "}
+            <span className="font-mono">hermes skills search</span>.
+          </>
+        )}
       </p>
     );
   }
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <span className="flex items-center gap-1 text-xs text-text-tertiary">
-        <Globe className="h-3 w-3" />
-        Connected hubs:
-      </span>
-      {sources.map((s) => {
-        const down =
-          (s.id === "hermes-index" && s.available === false) ||
-          (s.id === "github" && s.rate_limited === true);
-        return (
-          <Badge
-            key={s.id}
-            tone={down ? "outline" : "secondary"}
-            className={cn("text-xs", down && "opacity-60")}
-            title={
-              s.id === "github" && s.rate_limited
-                ? "GitHub API rate-limited — set GITHUB_TOKEN to raise the limit"
-                : s.id === "hermes-index" && s.available === false
-                  ? "Centralized index unavailable — falling back to live sources"
-                  : undefined
-            }
-          >
-            {s.label}
-            {s.id === "github" && s.rate_limited ? " (rate-limited)" : ""}
-          </Badge>
-        );
-      })}
+    <div className="flex flex-col gap-1">
+      {error && (
+        <span className="flex items-center gap-1 text-xs text-amber-300">
+          <AlertTriangle className="h-3 w-3" />
+          Source status refresh failed: {error}
+        </span>
+      )}
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="flex items-center gap-1 text-xs text-text-tertiary">
+          <Globe className="h-3 w-3" />
+          Connected hubs:
+        </span>
+        {sources.map((s) => {
+          const down =
+            Boolean(s.error) ||
+            (s.id === "hermes-index" && s.available === false) ||
+            (s.id === "github" && s.rate_limited === true);
+          const title = s.error
+            ? s.error
+            : s.id === "github" && s.rate_limited
+              ? "GitHub API rate-limited - set GITHUB_TOKEN to raise the limit"
+              : s.id === "hermes-index" && s.available === false
+                ? "Centralized index unavailable - falling back to live sources"
+                : undefined;
+          return (
+            <Badge
+              key={s.id}
+              tone={down ? "outline" : "secondary"}
+              className={cn("text-xs", down && "opacity-60")}
+              title={title}
+            >
+              {s.label}
+              {s.error ? " (degraded)" : ""}
+              {s.id === "github" && s.rate_limited ? " (rate-limited)" : ""}
+            </Badge>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -1165,7 +1226,6 @@ function SkillDetailDialog({
 
   useEffect(() => {
     let cancelled = false;
-    setPreviewLoading(true);
     api
       .previewSkillFromHub(result.identifier)
       .then((p) => !cancelled && setPreview(p))

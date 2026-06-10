@@ -362,6 +362,41 @@ class TestSkillsHubSearchEndpoint:
         assert body["timed_out"] == []
         assert body["installed"] == {}
 
+    def test_search_returns_partial_results_with_timeout_metadata(self, monkeypatch):
+        class _Src:
+            def __init__(self, sid):
+                self._sid = sid
+
+            def source_id(self):
+                return self._sid
+
+        class _Meta:
+            name = "fast"
+            description = "desc"
+            source = "fast"
+            identifier = "fast/skill"
+            trust_level = "community"
+            repo = "owner/repo"
+            tags = ["a"]
+
+        def _fake_search(sources, **kwargs):
+            assert kwargs["per_source_limits"] == {"fast": 3, "slow": 3}
+            assert kwargs["source_filter"] == "all"
+            return [_Meta()], {"fast": 1}, ["slow"]
+
+        monkeypatch.setattr(
+            "tools.skills_hub.create_source_router",
+            lambda: [_Src("fast"), _Src("slow")],
+        )
+        monkeypatch.setattr("tools.skills_hub.parallel_search_sources", _fake_search)
+
+        r = self.client.get("/api/skills/hub/search?q=foo&limit=3")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["results"][0]["identifier"] == "fast/skill"
+        assert body["source_counts"] == {"fast": 1}
+        assert body["timed_out"] == ["slow"]
+
 
 class _FakeMeta:
     """Minimal SkillMeta stand-in for monkeypatched source search."""
@@ -439,6 +474,22 @@ class TestSkillsHubSourcesEndpoint:
         assert len(body["featured"]) == 1
         assert body["featured"][0]["trust_level"] == "trusted"
         assert isinstance(body["installed"], dict)
+
+    def test_sources_returns_known_hubs_when_router_fails(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("router down")
+
+        monkeypatch.setattr("tools.skills_hub.create_source_router", _boom)
+
+        r = self.client.get("/api/skills/hub/sources")
+        assert r.status_code == 200
+        body = r.json()
+        ids = {s["id"] for s in body["sources"]}
+        assert {"official", "hermes-index", "github"} <= ids
+        assert body["index_available"] is False
+        assert body["featured"] == []
+        assert all(s.get("label") for s in body["sources"])
+        assert all(s.get("error") == "router down" for s in body["sources"])
 
 
 class TestSkillsHubPreviewEndpoint:
@@ -953,4 +1004,3 @@ class TestToolsConfigEndpoints:
                 kwargs["json"] = payload
             r = fn(path, **kwargs)
             assert r.status_code == 401, f"{method} {path} not gated"
-

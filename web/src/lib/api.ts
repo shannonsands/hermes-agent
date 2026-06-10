@@ -963,9 +963,10 @@ export const api = {
     }),
   updateSkillsFromHub: () =>
     fetchJSON<ActionResponse>("/api/skills/hub/update", { method: "POST" }),
-  searchSkillsHub: (q: string, source = "all", limit = 20) =>
+  searchSkillsHub: (q: string, source = "all", limit = 20, init?: RequestInit) =>
     fetchJSON<SkillHubSearchResponse>(
       `/api/skills/hub/search?q=${encodeURIComponent(q)}&source=${encodeURIComponent(source)}&limit=${limit}`,
+      init,
     ),
   getSkillHubSources: () =>
     fetchJSON<SkillHubSourcesResponse>("/api/skills/hub/sources"),
@@ -1057,6 +1058,8 @@ export interface SkillHubSource {
   rate_limited?: boolean;
   /** hermes-index only: whether the centralized index loaded. */
   available?: boolean;
+  /** Best-effort source status detail when probing this source failed. */
+  error?: string;
 }
 
 export interface SkillHubSourcesResponse {

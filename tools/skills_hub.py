@@ -3739,7 +3739,11 @@ def parallel_search_sources(
     *on_source_done* is an optional callback ``(source_id, count) -> None``
     invoked as each source completes — useful for progress indicators.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import (
+        ThreadPoolExecutor,
+        TimeoutError as FuturesTimeoutError,
+        as_completed,
+    )
 
     per_source_limits = per_source_limits or {}
 
@@ -3774,8 +3778,22 @@ def parallel_search_sources(
     if not active:
         return all_results, source_counts, timed_out_ids
 
-    with ThreadPoolExecutor(max_workers=min(len(active), 8)) as pool:
-        futures = {}
+    pool = ThreadPoolExecutor(max_workers=min(len(active), 8))
+    futures = {}
+    processed = set()
+
+    def _record_future(fut) -> None:
+        processed.add(fut)
+        try:
+            sid, results = fut.result(timeout=0)
+            source_counts[sid] = len(results)
+            all_results.extend(results)
+            if on_source_done:
+                on_source_done(sid, len(results))
+        except Exception:
+            pass
+
+    try:
         for src in active:
             lim = per_source_limits.get(src.source_id(), 50)
             fut = pool.submit(_search_one_source, src, query, lim)
@@ -3783,23 +3801,24 @@ def parallel_search_sources(
 
         try:
             for fut in as_completed(futures, timeout=overall_timeout):
-                try:
-                    sid, results = fut.result(timeout=0)
-                    source_counts[sid] = len(results)
-                    all_results.extend(results)
-                    if on_source_done:
-                        on_source_done(sid, len(results))
-                except Exception:
-                    pass
-        except TimeoutError:
+                _record_future(fut)
+        except FuturesTimeoutError:
+            for fut in futures:
+                if fut.done() and fut not in processed:
+                    _record_future(fut)
             timed_out_ids = [
                 futures[f] for f in futures if not f.done()
             ]
+            for fut in futures:
+                if not fut.done():
+                    fut.cancel()
             if timed_out_ids:
                 logger.debug(
                     "Skills browse timed out waiting for: %s",
                     ", ".join(timed_out_ids),
                 )
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     return all_results, source_counts, timed_out_ids
 

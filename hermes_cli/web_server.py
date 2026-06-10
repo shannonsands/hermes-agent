@@ -7031,6 +7031,27 @@ _SKILL_HUB_SOURCE_LABELS = {
 }
 
 
+def _skill_hub_source_entry(source_id: str, *, error: str | None = None) -> dict:
+    entry = {
+        "id": source_id,
+        "label": _SKILL_HUB_SOURCE_LABELS.get(source_id, source_id),
+    }
+    if source_id == "hermes-index":
+        entry["available"] = False
+    if source_id == "github":
+        entry["rate_limited"] = False
+    if error:
+        entry["error"] = error
+    return entry
+
+
+def _default_skill_hub_source_entries(*, error: str | None = None) -> list[dict]:
+    return [
+        _skill_hub_source_entry(source_id, error=error)
+        for source_id in _SKILL_HUB_SOURCE_LABELS
+    ]
+
+
 def _skill_meta_to_payload(m) -> dict:
     return {
         "name": m.name,
@@ -7079,12 +7100,31 @@ async def list_skills_hub_sources():
     def _run():
         from tools.skills_hub import create_source_router
 
-        sources = create_source_router()
+        try:
+            sources = create_source_router()
+        except Exception as exc:
+            source_error = str(exc) or exc.__class__.__name__
+            return {
+                "sources": _default_skill_hub_source_entries(error=source_error),
+                "index_available": False,
+                "featured": [],
+                "installed": _installed_hub_identifiers(),
+            }
+
         out = []
         index_available = False
         featured = []
         for src in sources:
-            sid = src.source_id()
+            try:
+                sid = src.source_id()
+            except Exception as exc:
+                out.append(
+                    _skill_hub_source_entry(
+                        "unknown",
+                        error=str(exc) or exc.__class__.__name__,
+                    )
+                )
+                continue
             entry = {
                 "id": sid,
                 "label": _SKILL_HUB_SOURCE_LABELS.get(sid, sid),
@@ -7093,13 +7133,15 @@ async def list_skills_hub_sources():
             if sid == "github":
                 try:
                     entry["rate_limited"] = bool(getattr(src, "is_rate_limited", False))
-                except Exception:
+                except Exception as exc:
                     entry["rate_limited"] = False
+                    entry["error"] = str(exc) or exc.__class__.__name__
             if sid == "hermes-index":
                 try:
                     index_available = bool(getattr(src, "is_available", False))
-                except Exception:
+                except Exception as exc:
                     index_available = False
+                    entry["error"] = str(exc) or exc.__class__.__name__
                 entry["available"] = index_available
                 # Empty-query search on the index returns featured/popular skills.
                 if index_available:
@@ -7107,8 +7149,9 @@ async def list_skills_hub_sources():
                         featured = [
                             _skill_meta_to_payload(m) for m in src.search("", limit=12)
                         ]
-                    except Exception:
+                    except Exception as exc:
                         featured = []
+                        entry["error"] = str(exc) or exc.__class__.__name__
             out.append(entry)
         return {
             "sources": out,
@@ -7142,8 +7185,18 @@ async def search_skills_hub(q: str = "", source: str = "all", limit: int = 20):
 
         sources = create_source_router()
         capped = min(max(limit, 1), 50)
+        per_source_limits = {}
+        for src in sources:
+            try:
+                per_source_limits[src.source_id()] = capped
+            except Exception:
+                pass
         all_results, source_counts, timed_out = parallel_search_sources(
-            sources, query=query, source_filter=source or "all", overall_timeout=30
+            sources,
+            query=query,
+            per_source_limits=per_source_limits,
+            source_filter=source or "all",
+            overall_timeout=30,
         )
 
         # Dedupe by identifier, preferring higher trust (mirrors unified_search).

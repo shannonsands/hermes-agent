@@ -1,6 +1,7 @@
 """Tests for tools/skills_hub.py — source adapters, lock file, taps, dedup logic."""
 
 import json
+import time
 from unittest.mock import patch, MagicMock
 
 import httpx
@@ -21,6 +22,7 @@ from tools.skills_hub import (
     bundle_content_hash,
     check_for_skill_updates,
     create_source_router,
+    parallel_search_sources,
     unified_search,
     append_audit_log,
     _skill_meta_to_dict,
@@ -1491,6 +1493,73 @@ class TestConvertToSkillMd:
         agent_data = {"identifier": "bare-agent"}
         result = LobeHubSource._convert_to_skill_md(agent_data)
         assert "name: bare-agent" in result
+
+
+# ---------------------------------------------------------------------------
+# parallel_search_sources — timeout/error handling
+# ---------------------------------------------------------------------------
+
+
+class TestParallelSearchSources:
+    def _make_source(self, source_id, results=None, *, delay=0.0, error=None):
+        class _Source:
+            def source_id(self):
+                return source_id
+
+            def search(self, query, limit=10):
+                if delay:
+                    time.sleep(delay)
+                if error:
+                    raise error
+                return results or []
+
+        return _Source()
+
+    def test_timeout_returns_partial_results_without_waiting_for_slow_source(self):
+        fast_result = SkillMeta(
+            name="fast",
+            description="d",
+            source="fast",
+            identifier="fast/skill",
+            trust_level="community",
+        )
+        fast = self._make_source("fast", [fast_result])
+        slow = self._make_source("slow", [], delay=0.8)
+
+        start = time.monotonic()
+        results, counts, timed_out = parallel_search_sources(
+            [fast, slow],
+            query="skill",
+            overall_timeout=0.05,
+        )
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.5
+        assert results == [fast_result]
+        assert counts == {"fast": 1}
+        assert timed_out == ["slow"]
+
+    def test_source_error_returns_empty_results_for_that_source(self):
+        ok_result = SkillMeta(
+            name="ok",
+            description="d",
+            source="ok",
+            identifier="ok/skill",
+            trust_level="community",
+        )
+        failing = self._make_source("fail", error=RuntimeError("boom"))
+        ok = self._make_source("ok", [ok_result])
+
+        results, counts, timed_out = parallel_search_sources(
+            [failing, ok],
+            query="skill",
+            overall_timeout=1,
+        )
+
+        assert results == [ok_result]
+        assert counts["fail"] == 0
+        assert counts["ok"] == 1
+        assert timed_out == []
 
 
 # ---------------------------------------------------------------------------
