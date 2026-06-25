@@ -1047,7 +1047,7 @@ export default function SystemPage() {
               Security audit
             </Button>
             <Button size="sm" ghost prefix={<Database className="h-3.5 w-3.5" />} onClick={() => runOp(() => api.runBackup(), "Backup")}>
-              Create backup
+              Create full backup
             </Button>
             <Button size="sm" ghost prefix={<RotateCw className="h-3.5 w-3.5" />} onClick={() => runOp(api.updateSkillsFromHub, "Skills update")}>
               Update skills
@@ -1189,8 +1189,13 @@ export default function SystemPage() {
         <Card>
           <CardContent className="flex flex-col gap-3 py-4 sm:flex-row sm:items-end">
             <div className="grid gap-2 flex-1">
-              <Label htmlFor="import-path">Restore from backup archive</Label>
-              <Input id="import-path" value={importPath} onChange={(e) => setImportPath(e.target.value)} placeholder="/path/to/hermes-backup.zip" />
+              <Label htmlFor="import-path">Restore full backup archive</Label>
+              <Input id="import-path" value={importPath} onChange={(e) => setImportPath(e.target.value)} placeholder="/opt/data/hermes-backup.zip" />
+              <p className="text-xs text-muted-foreground">
+                Uses a backup zip path on the dashboard host. In hosted containers,
+                upload the zip on Files first, then use its /opt/data path. Session
+                JSON imports are on Sessions.
+              </p>
             </div>
             <Button
               size="sm"
@@ -1205,7 +1210,7 @@ export default function SystemPage() {
             </Button>
             <ConfirmDialog
               open={importConfirmOpen}
-              title="Restore from backup?"
+              title="Restore full Hermes backup?"
               description={`This will overwrite your current Hermes configuration, skills, sessions, and data with the contents of ${importPath.trim() || "the archive"}. This cannot be undone.`}
               destructive
               confirmLabel="Restore"

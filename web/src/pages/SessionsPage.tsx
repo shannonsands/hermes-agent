@@ -25,6 +25,7 @@ import {
   Play,
   Eraser,
   Download,
+  Upload,
   Pencil,
   Check,
   Archive,
@@ -33,6 +34,7 @@ import { api } from "@/lib/api";
 import { shouldRefreshSessions } from "@/lib/session-refresh";
 import type {
   SessionInfo,
+  SessionImportResponse,
   SessionMessage,
   SessionSearchResult,
   SessionStoreStats,
@@ -104,6 +106,49 @@ function SnippetHighlight({ snippet }: { snippet: string }) {
       {parts}
     </p>
   );
+}
+
+type ImportableSession = Record<string, unknown>;
+
+function normalizeImportSessions(value: unknown): ImportableSession[] {
+  const candidate =
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Array.isArray((value as { sessions?: unknown }).sessions)
+      ? (value as { sessions: unknown[] }).sessions
+      : Array.isArray(value)
+        ? value
+        : [value];
+
+  const sessions = candidate.filter(
+    (item): item is ImportableSession =>
+      !!item && typeof item === "object" && !Array.isArray(item),
+  );
+  if (sessions.length !== candidate.length) {
+    throw new Error("Expected exported session JSON or JSONL");
+  }
+  return sessions;
+}
+
+function parseImportSessions(text: string): ImportableSession[] {
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error("File is empty");
+
+  try {
+    return normalizeImportSessions(JSON.parse(trimmed));
+  } catch (jsonError) {
+    const lines = trimmed.split(/\r?\n/).filter((line) => line.trim());
+    if (lines.length <= 1) throw jsonError;
+    return normalizeImportSessions(lines.map((line) => JSON.parse(line)));
+  }
+}
+
+function importSummary(result: SessionImportResponse): string {
+  const parts = [`${result.imported} imported`];
+  if (result.skipped > 0) parts.push(`${result.skipped} skipped`);
+  if (result.detached > 0) parts.push(`${result.detached} detached from missing parents`);
+  return parts.join("; ");
 }
 
 function ToolCallBlock({
@@ -725,6 +770,7 @@ export default function SessionsPage() {
   >(null);
   const [searching, setSearching] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(null);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   const logScrollRef = useRef<HTMLPreElement | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [overviewSessions, setOverviewSessions] = useState<SessionInfo[]>([]);
@@ -757,6 +803,7 @@ export default function SessionsPage() {
   const [pruneOpen, setPruneOpen] = useState(false);
   const [pruneDays, setPruneDays] = useState("90");
   const [pruning, setPruning] = useState(false);
+  const [importingSessions, setImportingSessions] = useState(false);
   const { toast, showToast } = useToast();
   const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
@@ -830,6 +877,37 @@ export default function SessionsPage() {
       .then(setStats)
       .catch(() => {});
   }, []);
+
+  const handleImportSessions = useCallback(
+    async (files: FileList | null) => {
+      const file = files?.[0];
+      if (!file) return;
+      setImportingSessions(true);
+      try {
+        const text = await file.text();
+        const importedSessions = parseImportSessions(text);
+        const result = await api.importSessions(importedSessions);
+        showToast(`Import complete: ${importSummary(result)}`, "success");
+        clearSelection();
+        loadSessions(page, true);
+        loadStats();
+        refreshEmptyCount();
+      } catch (error) {
+        showToast(`Import failed: ${error}`, "error");
+      } finally {
+        setImportingSessions(false);
+        if (importInputRef.current) importInputRef.current.value = "";
+      }
+    },
+    [
+      clearSelection,
+      loadSessions,
+      loadStats,
+      page,
+      refreshEmptyCount,
+      showToast,
+    ],
+  );
 
   useEffect(() => {
     loadStats();
@@ -1249,6 +1327,13 @@ export default function SessionsPage() {
     <div className="flex min-w-0 w-full max-w-full flex-col gap-4">
       <PluginSlot name="sessions:top" />
       <Toast toast={toast} />
+      <input
+        ref={importInputRef}
+        type="file"
+        accept=".json,.jsonl,application/json,application/x-ndjson"
+        className="hidden"
+        onChange={(event) => void handleImportSessions(event.currentTarget.files)}
+      />
 
       <DeleteConfirmDialog
         open={sessionDelete.isOpen}
@@ -1524,6 +1609,23 @@ export default function SessionsPage() {
               >
                 <span className="font-mondwest normal-case text-xs">
                   {t.sessions.deleteEmpty} ({emptyCount})
+                </span>
+              </Button>
+            )}
+
+            {!isSearching && (
+              <Button
+                outlined
+                size="sm"
+                className="shrink-0"
+                disabled={importingSessions}
+                onClick={() => importInputRef.current?.click()}
+                aria-label="Import exported sessions"
+                title="Import exported session JSON or JSONL"
+                prefix={importingSessions ? <Spinner /> : <Upload />}
+              >
+                <span className="font-mondwest normal-case text-xs">
+                  Import sessions
                 </span>
               </Button>
             )}
