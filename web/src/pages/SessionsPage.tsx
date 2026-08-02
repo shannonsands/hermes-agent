@@ -88,6 +88,7 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
     email: { icon: MessageSquare, color: "text-[oklch(0.7_0.15_155)]" },
     sms: { icon: MessageCircle, color: "text-success" },
     cron: { icon: Clock, color: "text-warning" },
+    kanban: { icon: Play, color: "text-warning" },
     tool: { icon: Play, color: "text-warning" },
     api_server: { icon: Globe, color: "text-muted-foreground" },
     acp: { icon: Database, color: "text-muted-foreground" },
@@ -97,6 +98,7 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
   };
 
 const AUTOMATION_SESSION_SOURCES = [
+  "kanban",
   "cron",
   "tool",
   "api_server",
@@ -148,6 +150,8 @@ function sourceLabel(source: string): string {
       return "SMS";
     case "cron":
       return "Cron";
+    case "kanban":
+      return "Kanban";
     case "tool":
       return "Tool";
     case "hermes_flow":
