@@ -10894,6 +10894,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _cfg = load_config_readonly()
             _model_config = _cfg.get("model", {}) if isinstance(_cfg, dict) else {}
         except Exception:
+            logger.warning(
+                "/model reset: fresh config.yaml read failed; falling back to "
+                "the startup config snapshot (the default shown may be stale "
+                "if config.yaml changed since this CLI session started)",
+                exc_info=True,
+            )
             _model_config = CLI_CONFIG.get("model", {})
         if isinstance(_model_config, dict):
             default_model = str(

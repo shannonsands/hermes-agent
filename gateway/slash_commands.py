@@ -2577,6 +2577,24 @@ class GatewaySlashCommandsMixin:
             )
         except Exception:
             logger.debug("Default-model resolution after reset failed", exc_info=True)
+        if not default_model:
+            # Channel resolution failed — fall back to the raw config default
+            # so the confirmation never reads "now using `unknown`". The
+            # literal is kept only as the final guard for a config with no
+            # model.default at all (not representable as a real model name).
+            try:
+                from gateway.run import _load_gateway_config
+
+                _cfg = _load_gateway_config() or {}
+                _model_cfg = _cfg.get("model") or {}
+                if isinstance(_model_cfg, dict):
+                    default_model = str(
+                        _model_cfg.get("default") or _model_cfg.get("model") or ""
+                    ).strip()
+                else:
+                    default_model = str(_model_cfg or "").strip()
+            except Exception:
+                logger.debug("Config-default fallback after reset failed", exc_info=True)
         default_model = default_model or "unknown"
 
         if not had_override:

@@ -673,6 +673,11 @@ def is_model_reset_request(request: "ModelSwitchRequest") -> bool:
     the comparison is against the whole normalized target.  Flag
     combinations (``/model reset --global``) are rejected at parse time via
     ``MODEL_SWITCH_ERR_RESET_WITH_FLAGS``.
+
+    A model literally named ``reset`` is therefore unreachable by bare name,
+    deliberately: reserving the token is what makes the command discoverable.
+    The escape hatch is the qualified slug — ``/model vendor/reset`` (or
+    ``vendor:reset``) compares as the whole target and switches normally.
     """
     return (
         request.target.strip().lower() in MODEL_SWITCH_RESET_TOKENS
