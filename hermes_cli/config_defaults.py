@@ -2391,6 +2391,21 @@ DEFAULT_CONFIG = {
             "installed_updates": "immediate",
             "new_skills": "daily",
         },
+        # Agent-led sharing: a weekly agent review of real 7-day usage
+        # proposes at most a few bespoke skills to share, with fixed copy and
+        # native buttons. When disabled, only the deterministic qualification
+        # triggers (consecutive-day / refinement) surface candidates.
+        # Server-provided org policy overrides these local values when the
+        # Gateway exposes an agentLed policy block.
+        "agent_led": {
+            "enabled": True,
+            "window_days": 7,
+            "min_aggregate_count": 3,
+            "max_candidates": 3,
+            "dismiss_suppression_days": 30,
+            "popular_install_threshold": 10,
+            "review_interval_hours": 24 * 7,
+        },
     },
 
     # Curator — background skill maintenance.
