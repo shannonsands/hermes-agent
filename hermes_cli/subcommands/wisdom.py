@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any, Callable
 
 
@@ -17,6 +18,13 @@ def _emit(value: Any, *, as_json: bool) -> None:
         print(json.dumps(value, indent=2, ensure_ascii=False, default=str))
     else:
         print(value)
+
+
+def _cli_sender(event: Any) -> None:
+    """Default delivery for CLI-triggered weekly reviews: print the notice."""
+    from hermes_wisdom.agent_led.render import render_plain
+
+    print(render_plain(event))
 
 
 def cmd_wisdom(args: argparse.Namespace) -> int:
@@ -164,6 +172,68 @@ def cmd_wisdom(args: argparse.Namespace) -> int:
             result = service.uninstall(args.skill_id)
         elif command == "notifications":
             result = service.notifications(mark_seen=args.mark_seen)
+        elif command == "browse":
+            result = {"skills": service.search_skills(getattr(args, "query", None))}
+        elif command == "review-week":
+            from hermes_wisdom.agent_led.weekly import run_weekly_review
+
+            result = run_weekly_review(
+                store=service.store,
+                service=service,
+                force=bool(getattr(args, "force", False)),
+                sender=None if getattr(args, "dry_run", False) else _cli_sender,
+            )
+        elif command == "act":
+            from hermes_wisdom.agent_led.actions import handle_action
+
+            result = handle_action(
+                args.target, service=service, mute_choice=getattr(args, "mute", None)
+            )
+        elif command == "share":
+            from hermes_wisdom.agent_led.share_flow import ShareFlow
+
+            flow = ShareFlow(getattr(args, "flow_id", None))
+            if args.share_step == "start":
+                from tools.skill_usage import _find_skill_dir
+
+                path = _find_skill_dir(args.skill)
+                if path is None:
+                    raise PackagePolicyError(f"skill not found: {args.skill}")
+                result = flow.start(path)
+            elif args.share_step == "package":
+                result = flow.package()
+            elif args.share_step == "request-changes":
+                result = flow.request_changes(args.note or "")
+            elif args.share_step == "cancel":
+                result = flow.cancel()
+            elif args.share_step == "approve":
+                from hermes_wisdom.agent_led.share_flow import submit_via_service
+                from hermes_constants import get_hermes_home
+
+                staging = Path(get_hermes_home()) / "wisdom" / "share_staging"
+                result = flow.approve(submit=submit_via_service(service, staging))
+            else:
+                result = flow.summary()
+        elif command == "dismiss":
+            from hermes_wisdom.agent_led.history import SuggestionHistory
+            from hermes_wisdom.agent_led.policy import load_policy
+
+            policy = load_policy(client=service.client)
+            result = SuggestionHistory().record_dismissal(
+                args.skill,
+                args.content_hash,
+                suppression_days=args.days or policy.dismiss_suppression_days,
+                client=service.client,
+            )
+        elif command == "mute":
+            from hermes_wisdom.agent_led.history import SuggestionHistory
+            from hermes_wisdom.agent_led.templates import mute_duration_days
+
+            result = SuggestionHistory().record_mute(
+                args.skill_id or "*",
+                days=mute_duration_days(args.duration),
+                client=service.client,
+            )
         else:
             args._wisdom_parser.print_help()
             return 2
@@ -295,3 +365,32 @@ def build_wisdom_parser(subparsers) -> None:
     uninstall.add_argument("--yes", action="store_true", help="Confirm uninstall")
     notifications = add("notifications", "Show durable local Wisdom notices")
     notifications.add_argument("--mark-seen", action="store_true")
+    browse = add("browse", "Search the organization catalog by keyword")
+    browse.add_argument("query", nargs="?")
+    review_week = add(
+        "review-week", "Run the agent-led weekly review of your recently used skills"
+    )
+    review_week.add_argument(
+        "--force", action="store_true", help="Run even if the weekly interval has not elapsed"
+    )
+    review_week.add_argument(
+        "--dry-run", action="store_true", help="Build recommendations without delivering them"
+    )
+    act = add("act", "Resolve an agent-led recommendation button target")
+    act.add_argument("target")
+    act.add_argument("--mute", choices=["1d", "1w", "30d", "forever"], help="Mute duration")
+    share = add("share", "Agent-guided share flow (package, review, approve)")
+    share.add_argument(
+        "share_step",
+        choices=["start", "package", "request-changes", "approve", "cancel", "status"],
+    )
+    share.add_argument("skill", nargs="?", help="Skill name (start step)")
+    share.add_argument("--flow-id", dest="flow_id", help="Resume an existing flow")
+    share.add_argument("--note", help="Requested changes (request-changes step)")
+    dismiss = add("dismiss", "Record 'Not now' for a skill at its current content hash")
+    dismiss.add_argument("skill")
+    dismiss.add_argument("content_hash")
+    dismiss.add_argument("--days", type=int, help="Suppression window (default from policy)")
+    mute = add("mute", "Mute proactive Wisdom suggestions")
+    mute.add_argument("duration", choices=["1d", "1w", "30d", "forever"])
+    mute.add_argument("--skill-id", dest="skill_id", help="Mute one skill instead of all")

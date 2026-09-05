@@ -7499,6 +7499,10 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- Collective Wisdom agent-led recommendation buttons ---
+        if data.startswith("wa:"):
+            await self._handle_wisdom_agent_callback(query, data)
+            return
         # --- Collective Wisdom managed install/update callbacks ---
         if data.startswith("wi:"):
             await self._handle_wisdom_callback(
@@ -7875,6 +7879,96 @@ class TelegramAdapter(BasePlatformAdapter):
                         answer, getattr(query.from_user, "id", "unknown"))
         except Exception as exc:
             logger.error("Failed to write update response from callback: %s", exc)
+
+    async def _handle_wisdom_agent_callback(self, query, data: str) -> None:
+        """Resolve an agent-led recommendation button through the delivery ledger.
+
+        Stale, expired, or already-handled targets answer with a clear message
+        and leave nothing half-applied. Mute shows the fixed duration options
+        as a second keyboard; the choice arrives as ``wa:mute:<dedup>:<key>``.
+        """
+        parts = data.split(":")
+        mute_choice = parts[3] if len(parts) == 4 and parts[1] == "mute" else None
+        target = ":".join(parts[:3])
+
+        def run():
+            from hermes_wisdom.agent_led.actions import handle_action
+            from hermes_wisdom.service import WisdomService
+
+            return handle_action(target, service=WisdomService(), mute_choice=mute_choice)
+
+        try:
+            result = await self._run_wisdom_profile_operation(run)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Collective Wisdom agent-led action failed: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+            await query.answer(text="Something went wrong; the buttons are still valid.")
+            return
+        if result.get("needs_choice"):
+            options = result["options"]["actions"]
+            keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(o["label"], callback_data=f"{target}:{o['id'].split(':', 1)[1]}") for o in options]]
+            )
+            try:
+                await query.edit_message_reply_markup(reply_markup=keyboard)
+            except Exception:
+                pass
+            await query.answer(text=result["options"]["title"])
+            return
+        message = str(result.get("message") or ("Done." if result.get("ok") else "Unavailable."))
+        await query.answer(text=message[:200])
+        if result.get("ok") or result.get("stale"):
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            if result.get("url"):
+                await query.message.reply_text(str(result["url"]))
+            elif result.get("flow") is not None:
+                await query.message.reply_text(
+                    "Share review started. Run /wisdom share status to continue; nothing is uploaded until you approve."
+                )
+
+    async def send_wisdom_agent_recommendation(self, chat_id: str, event, *, metadata=None) -> None:
+        """Deliver one agent-authored recommendation with native buttons."""
+        from hermes_wisdom.agent_led.render import render_plain, render_telegram_html
+
+        raw_request = getattr(getattr(self, "_bot", None), "do_api_request", None)
+        if callable(raw_request):
+            try:
+                await raw_request(
+                    "sendRichMessage",
+                    api_kwargs={
+                        "chat_id": normalize_telegram_chat_id(chat_id),
+                        "rich_message": {"html": render_telegram_html(event)},
+                        "link_preview_options": {"is_disabled": True},
+                    },
+                )
+                return
+            except Exception as exc:
+                logger.debug(
+                    "[%s] agent-led rich-card send failed: %s",
+                    self.name,
+                    _redact_telegram_error_text(exc),
+                )
+        if self._bot is None:
+            raise RuntimeError("telegram bot unavailable")
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(a.label, callback_data=a.target)
+                    for a in event.allowed_actions
+                ]
+            ]
+        )
+        await self._bot.send_message(
+            chat_id=normalize_telegram_chat_id(chat_id),
+            text=render_plain(event),
+            reply_markup=keyboard,
+        )
 
     async def _handle_wisdom_callback(
         self,
