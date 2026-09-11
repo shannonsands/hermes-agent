@@ -120,7 +120,7 @@ def process_share_package(mediation, org: str, job: dict, *, runtime) -> dict:
         advice = {
             "title": package.editorial_name,
             "relevance": "recommend",
-            "explanation": "Your proposed team package is ready to review. Nothing has been uploaded or published. Review its files and portability notes before approving sharing.",
+            "explanation": "Would you like to share it?",
         }
         db.execute(
             "UPDATE wisdom_assessment SET reference_json=?,advice_json=?,state='ready',updated_at=? WHERE id=?",

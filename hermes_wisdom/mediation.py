@@ -666,7 +666,7 @@ class WisdomMediation:
             "refinement": "You've really refined this skill.",
         }.get(
             event.get("qualification"),
-            "Hermes identified this local skill as a sharing candidate.",
+            "Hermes thinks the following skill would be useful to the rest of your team:",
         )
         return {
             "title": editorial.get("editorial_name") or name,

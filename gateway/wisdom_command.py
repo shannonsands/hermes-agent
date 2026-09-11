@@ -91,6 +91,7 @@ class WisdomItem:
     title: str
     detail: str = ""
     actions: list[WisdomAction] = field(default_factory=list)
+    preamble: str = ""
 
 
 @dataclass
@@ -111,6 +112,8 @@ class WisdomView:
         if self.summary:
             lines.extend(("", self.summary))
         for item in self.items:
+            if item.preamble:
+                lines.extend(("", item.preamble))
             lines.extend(("", item.title))
             if item.detail:
                 lines.append(item.detail)
@@ -137,6 +140,8 @@ class WisdomView:
         if self.summary:
             lines.extend(("", self.summary))
         for item in self.items:
+            if item.preamble:
+                lines.extend(("", item.preamble))
             lines.extend(("", item.title))
             if item.detail:
                 lines.append(item.detail)

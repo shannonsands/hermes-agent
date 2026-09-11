@@ -813,7 +813,7 @@ def test_presentation_keeps_canonical_warnings_and_primary_last(consent):
     }
     view = advice_view([item], introduction=True)
     assert "organization has enabled" in view.summary
-    assert "✅ Security check" in view.items[0].detail
+    assert "✅ No security issues detected" in view.items[0].detail
     assert [a.label for a in view.items[0].actions] == [
         "View Assessment",
         "Show checks",
@@ -964,7 +964,7 @@ def test_unavailable_assessment_offers_review_not_install(consent):
         }
     ])
     assert view.summary == "Assessment unavailable"
-    assert "✅ Security check" in view.to_text()
+    assert "✅ No security issues detected" in view.to_text()
     assert "recommendation" not in view.to_text().lower()
     assert [action.label for action in view.items[0].actions] == [
         "Show checks",

@@ -200,16 +200,16 @@ def test_native_review_uploads_private_draft_and_preserves_link(sharing, monkeyp
     view = click("inspect")
     assert service.client.uploaded == 1
     assert service.client.publications == 0
-    assert any(a.label == "View Skill" and "/wisdom/review/draft-1" in a.url for a in view.actions)
-    assert view.actions[-1].label == "Yes, share"
-    assert "private draft is ready" in view.to_text()
+    assert any(a.label == "View More Details" and "/wisdom/review/draft-1" in a.url for a in view.actions)
+    assert view.actions[-1].label == "Share My Skill"
+    assert "private draft is ready" not in view.to_text()
     current = mediation.consent.resolve("org", shown["id"], actor, "inspect")
     assert current["operation"] == "publish" and current["state"] == "pending"
     assert current["facts"]["hashes"]
     for action in ("review", "checks.show", "checks.hide"):
         toggled = click(action)
         actions = toggled.actions + [a for item in toggled.items for a in item.actions]
-        assert any(a.label == "View Skill" and a.url for a in actions)
+        assert any(a.label == "View More Details" and a.url for a in actions)
     assert service.client.uploaded == 1
     assert service.client.publications == 0
     assert "ORIGINAL_PRIVATE_SETUP" in (source / "SKILL.md").read_text()
@@ -294,6 +294,15 @@ def test_share_is_native_local_preparation_then_separate_exact_publication(shari
         assessor=no_assessment,
     )
     assert len(items) == 1
+    # Packaging creates a new deliverable message, not an edit of the queued card.
+    assert items[0]["assessment"]["id"] != shown["assessment_id"]
+    assert items[0]["advice"]["explanation"] == "Would you like to share it?"
+    assert mediation.begin_delivery("org", items)
+    assert mediation.queue.complete_delivery(
+        "org", items[0]["assessment"]["id"], items[0]["assessment"]["lease_token"],
+        receipt=DeliveryReceipt(platform="telegram", destination="chat", thread_id="thread",
+                                message_id="2", acknowledgement="provider_accepted"),
+    )
     final = items[0]["interaction"]
     assert final["operation"] == "publish" and final["id"] != shown["id"]
     assert "refs/wisdom-setup.md" in final["facts"]["file_names"]
@@ -313,7 +322,7 @@ def test_share_is_native_local_preparation_then_separate_exact_publication(shari
     assert service.client.uploaded == 1
     assert service.client.publications == 1
     receipt = interaction_view(result)
-    assert receipt.summary == "Published"
+    assert receipt.summary == "Shared!"
     reopened = mediation.consent.resolve("org", shown["id"], actor, "inspect")
     assert reopened["id"] == final["id"] and reopened["state"] == "completed"
     assert interaction_view(reopened).actions[0].url
@@ -413,10 +422,11 @@ def test_share_copy_and_controls_keep_publication_separate(sharing):
     _, _, _, shown, _, _, _ = sharing
     view = interaction_view(shown)
     assert [action.label for action in view.actions] == [
-        "Show checks",
-        "Not Now",
-        "Review first",
-        "Share",
+        "Review Checks",
+        "View More Details",
+        "Snooze Collective Wisdom",
+        "Maybe Later",
+        "Share My Skill",
     ]
     assert "Nothing is shared without your approval" not in view.to_text()
     assert view.items[0].detail.rstrip().endswith("Would you like to share it?")
@@ -433,14 +443,14 @@ def test_share_copy_and_controls_keep_publication_separate(sharing):
     assert "You can review the skill before publishing" not in view.to_text()
     assert view.items[0].detail.rstrip().endswith("Would you like to share it?")
     assert "handoff package" not in view.to_text()
-    assert "✅ Security check (local preflight)" in view.to_text()
+    assert "✅ No security issues detected" in view.to_text()
     assert "will be scanned" not in view.to_text()
     expanded = advice_view([
         {"advice": {"title": "Skill", "explanation": "Useful", "relevance": "recommend"},
          "interaction": shown}
     ], checks_expanded=True)
-    assert "✅ Private keys" in expanded.to_text()
-    assert "✅ Harmful instruction patterns" in expanded.to_text()
+    assert "✅ No private keys detected" in expanded.to_text()
+    assert "✅ No harmful instruction patterns" in expanded.to_text()
     assert "Pending" not in expanded.to_text()
 
 
@@ -485,16 +495,18 @@ def test_checks_toggle_is_read_only_and_preserves_consent(sharing, monkeypatch):
     expanded = toggle("show")
     assert "Profanity or abusive language" in expanded.to_text()
     assert "Check the wording." in expanded.to_text()
-    assert expanded.items[0].actions[0].label == "Hide checks"
+    assert expanded.items[0].actions[0].label == "Review Checks"
+    assert ":checks.hide:" in expanded.items[0].actions[0].callback_data
     collapsed = toggle("hide")
     assert "Profanity or abusive language" not in collapsed.to_text()
     assert "Needs a look before sharing at work" in collapsed.to_text()
     assert "Check the wording." not in collapsed.to_text()
     assert [a.label for a in collapsed.items[0].actions] == [
-        "Show checks",
-        "Not Now",
-        "Review first",
-        "Share",
+        "Review Checks",
+        "View More Details",
+        "Snooze Collective Wisdom",
+        "Maybe Later",
+        "Share My Skill",
     ]
     with pytest.raises(WisdomNotFound):
         toggle("show", "different-user")
@@ -521,7 +533,7 @@ def test_stale_checks_toggle_does_not_restore_actionable_advice(sharing):
         assert len(view.actions) == 2
         assert view.actions[-1].label == "Recheck"
         assert view.actions[0].label == ("Hide checks" if mode == "show" else "Show checks")
-        assert ("Private keys" in view.to_text()) == (mode == "show")
+        assert "No private keys detected" in view.to_text()
         assert "Pass" not in view.to_text()
         assert not any(action.primary for action in view.actions)
     model.assert_not_called()
@@ -536,7 +548,7 @@ def test_install_update_review_collapses_rows_without_hiding_warnings(sharing, o
     collapsed = interaction_view(shown)
     assert "⚠️ Security check: Advisory" in collapsed.to_text()
     assert "Review the policy finding." in collapsed.to_text()
-    assert "Organization policy" not in collapsed.to_text()
+    assert "Organization policy" in collapsed.to_text()
     assert collapsed.actions[0].label == "Show checks"
     assert collapsed.actions[-1].primary
     expanded = interaction_view(shown, checks_expanded=True)
@@ -628,7 +640,7 @@ def test_package_review_controls_never_upload_and_preserve_review(sharing, monke
 
 @pytest.mark.parametrize(
     "publication,title",
-    [("published", "Published"), ("pending_moderation", "Pending moderation")],
+    [("published", "Shared!"), ("pending_moderation", "Pending moderation")],
 )
 def test_publication_receipt_links_to_portal_without_expanding_checks(
     publication, title
@@ -644,7 +656,7 @@ def test_publication_receipt_links_to_portal_without_expanding_checks(
     })
     assert view.summary == title
     assert len(view.actions) == 1
-    assert view.actions[0].label == "View in Portal"
+    assert view.actions[0].label == "View details"
     assert view.actions[0].url == "https://portal.example/review/draft"
 
 

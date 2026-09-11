@@ -612,12 +612,21 @@ class SlackWisdomMixin:
                     from hermes_wisdom.service import WisdomService
 
                     message = body.get("message") or {}
-                    return resolve_surface_action(
-                        WisdomService(), value, platform="slack", actor_id=user_id,
+                    service = WisdomService()
+                    context = surface_context(self,
+                        user_id=user_id, chat_id=channel_id, profile=profile,
+                        organization_id=service.store.active_org_id(),
+                        is_group=self._wisdom_is_group_channel(channel_id),
+                        thread_id=str(message.get("thread_ts") or ""), scope_id=str(team_id or ""),
+                    )
+                    view = resolve_surface_action(
+                        service, value, platform="slack", actor_id=user_id,
                         chat_id=channel_id, thread_id=str(message.get("thread_ts") or ""),
                         scope_id=str(team_id or ""),
                     )
-                view = await self._run_wisdom_profile_operation(resolve, profile=profile)
+                    return view, context
+                view, context = await self._run_wisdom_profile_operation(resolve, profile=profile)
+                await self._prepare_wisdom_view(view, context, team_id=team_id, channel_id=channel_id)
                 await self._update_wisdom_interaction(body, view)
                 return
             if value.startswith("wi:continue:"):

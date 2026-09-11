@@ -29,7 +29,7 @@ CHECK_LABELS = {
     "manipulative_or_spam": "Manipulative, deceptive, or spam-like wording",
 }
 ReviewStatus = Literal["pass", "advisory", "unavailable"]
-PASS_TEXT = "Safe to share at work \u2713 (no inappropriate content found)"
+PASS_TEXT = "✅ Safe for work (no inappropriate content detected)"
 ADVISORY_TEXT = (
     "Needs a look before sharing at work (possible inappropriate content)"
 )

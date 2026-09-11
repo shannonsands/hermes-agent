@@ -86,7 +86,8 @@ def render_wisdom_blocks(view: Any) -> list[dict[str, Any]]:
     for item_index, item in enumerate(items):
         title = _escape_mrkdwn(getattr(item, "title", "Skill"))
         detail = _escape_mrkdwn(getattr(item, "detail", ""))
-        text = f"*{title}*"
+        preamble = _escape_mrkdwn(getattr(item, "preamble", ""))
+        text = (preamble + "\n\n" if preamble else "") + f"*{title}*"
         if detail:
             text += f"\n{detail}"
         blocks.append({

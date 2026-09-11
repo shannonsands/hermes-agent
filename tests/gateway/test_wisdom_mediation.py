@@ -248,6 +248,50 @@ async def test_telegram_native_rich_controls_escape_publisher_text():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["telegram", "slack"])
+async def test_sharing_callback_rebinds_snooze_in_same_private_context(monkeypatch, surface):
+    from gateway.wisdom_command import CALLBACK_TOKENS, WisdomCommandContext
+    from hermes_wisdom.mediation_view import interaction_view
+    from tests.wisdom.test_sharing_gallery import candidate, passing_facts
+
+    current = candidate()
+    current["facts"].update(passing_facts())
+    projected = interaction_view(current)
+    service = Mock()
+    service.store.active_org_id.return_value = "org"
+    monkeypatch.setattr("hermes_wisdom.service.WisdomService", lambda: service)
+    monkeypatch.setattr("hermes_wisdom.mediation_view.resolve_surface_action", lambda *a, **k: projected)
+    adapter = telegram_adapter() if surface == "telegram" else slack_adapter()
+    adapter._owner_profile = "primary"
+    adapter._run_wisdom_profile_operation = AsyncMock(side_effect=lambda fn, **_: fn())
+    if surface == "telegram":
+        adapter._is_callback_user_authorized = Mock(return_value=True)
+        query = SimpleNamespace(from_user=SimpleNamespace(id="user"), answer=AsyncMock(),
+                                message=SimpleNamespace(chat_id=42, message_id=19))
+        await adapter._handle_wisdom_callback(
+            query, "wi:agent:checks.show:exact-package", query_chat_id="42",
+            query_chat_type="private", query_thread_id="", query_user_name="Member",
+        )
+        rendered = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["html"]
+        context = WisdomCommandContext("user", "42", "primary", "org")
+    else:
+        adapter._is_interactive_user_authorized = Mock(return_value=True)
+        adapter._wisdom_callback_profile = Mock(return_value="primary")
+        adapter._update_wisdom_interaction = AsyncMock()
+        body = {"user": {"id": "user"}, "channel": {"id": "D1"},
+                "team": {"id": "T1"}, "message": {"ts": "19"}}
+        await adapter._handle_wisdom_action(AsyncMock(), body, {"value": "wi:agent:checks.show:exact-package"})
+        sent = adapter._update_wisdom_interaction.call_args.args[1]
+        from plugins.platforms.slack.wisdom_blocks import render_wisdom_blocks
+        rendered = str(render_wisdom_blocks(sent))
+        context = WisdomCommandContext("user", "D1", "primary", "org", scope_id="T1")
+    assert "Snooze Collective Wisdom" in rendered
+    settings = next(a for a in projected.actions if a.operation == "mute")
+    token = settings.callback_data.removeprefix("wi:cmd:")
+    assert CALLBACK_TOKENS.resolve(token, context, consume=False).operation == "mute"
+
+
+@pytest.mark.asyncio
 async def test_expanded_checks_edit_keeps_full_checklist():
     adapter = telegram_adapter()
     current = view()
@@ -353,6 +397,7 @@ async def test_native_install_retry_after_edit_failure_only_updates_completed_ca
     assert service.store.installation("skill-1")["state"] == "active"
     assert consent.resolve("org-1", shown["id"], actor, "inspect")["state"] == "completed"
     if surface == "telegram":
+        assert query.answer.call_args_list[0].kwargs["text"] == "Gathering the necessary details"
         assert any(call.kwargs.get("show_alert") for call in query.answer.call_args_list)
         query.edit_message_text.assert_not_awaited()
     else:
