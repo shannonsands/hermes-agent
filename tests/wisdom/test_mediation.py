@@ -604,12 +604,12 @@ def test_replacement_legacy_review_uses_native_actor_bound_controls(
     )
     view = current_action_view("wa:install:untrusted-old-id", instance.service, context)
     controls = [action for item in view.items for action in item.actions]
-    assert [action.callback_data for action in controls] == [
-        f"wi:agent:checks.show:{shown['id']}",
+    assert [action.callback_data for action in controls if action.operation != "mute"] == [
+        f"wi:agent:assessment.show:{shown['id']}",
         f"wi:agent:defer:{shown['id']}",
-        f"wi:agent:inspect:{shown['id']}",
         f"wi:agent:confirm:{shown['id']}",
     ]
+    assert next(action for action in controls if action.operation == "mute").local_command == "/wisdom mute"
     instance.service.install_apply.assert_not_called()
     confirm = controls[-1].callback_data
     with pytest.raises(WisdomNotFound):
@@ -820,16 +820,15 @@ def test_presentation_keeps_canonical_warnings_and_primary_last(consent):
     }
     view = advice_view([item], introduction=True)
     assert "organization has enabled" in view.summary
-    assert "✅ Security check" in view.items[0].detail
+    assert "✅ No security issues detected" in view.items[0].detail
     assert [a.label for a in view.items[0].actions] == [
-        "View Assessment",
-        "Show checks",
+        "View Details",
         "Not Now",
-        "Review first",
-        "Install",
+        "Mute Skill Recommendations",
+        "Install Skill",
     ]
     assert "wip_one" not in interaction_view(shown).to_text()
-    assert "A suggestion" not in view.to_text()
+    assert "A suggestion" in view.to_text()
     assert "A suggestion" in advice_view([item], assessment_expanded=True).to_text()
     digest = {"advice": {**item["advice"], "relevance": "digest"}}
     groups = delivery_groups([item, *([digest] * 8)])
@@ -971,17 +970,17 @@ def test_unavailable_assessment_offers_review_not_install(consent):
         }
     ])
     assert view.summary == "Assessment unavailable"
-    assert "✅ Security check" in view.to_text()
+    assert "Unavailable" in view.to_text()
     assert "recommendation" not in view.to_text().lower()
     assert [action.label for action in view.items[0].actions] == [
-        "Show checks",
+        "View Details",
         "Not Now",
-        "Review skill",
+        "Mute Skill Recommendations",
     ]
-    assert view.items[0].actions[-1].primary
-    assert view.items[0].actions[-1].callback_data == f"wi:agent:inspect:{shown['id']}"
+    assert not any(a.primary for a in view.items[0].actions)
+    assert view.items[0].actions[0].callback_data == f"wi:agent:assessment.show:{shown['id']}"
     # The existing explicit confirmation remains available after opening review.
-    assert interaction_view(shown).actions[-1].label == "Install"
+    assert interaction_view(shown).actions[-1].label == "Install Skill"
 
 
 def test_digest_preserves_individual_skills_without_recommendation_heading():

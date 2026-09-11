@@ -37,7 +37,7 @@ def test_local_guard_failure_is_not_a_pass():
 def test_local_checklist_does_not_claim_gateway_checks_have_run():
     result = prepared_security_check([], "Safe", {"guard": {"allowed": True}})
     text = full_review_text(result, {"status": "pass"})
-    assert "✅ Private keys" in text
+    assert "✅ No private keys detected" in text
     assert "⏳ Organization policy: Pending" in text
     assert "⏳ Personal information: Pending" in text
     assert "Required Gateway check after you authorize upload; before publication." in text
@@ -62,9 +62,13 @@ def test_approval_card_surfaces_local_results_and_preserves_blocking(allowed, tm
         "interaction": interaction,
     }
     compact = advice_view([item]).items[0]
-    assert check["summary"] in compact.detail
+    if check["local_status"] != "pass":
+        assert check["summary"] in compact.detail
+    else:
+        assert "✅ No security issues detected" in compact.detail
+        assert "⏳ Organization policy: Pending" in compact.detail
     assert "Private keys" not in compact.detail
     expanded = advice_view([item], checks_expanded=True).items[0]
-    assert "✅ Private keys" in expanded.detail
+    assert "✅ No private keys detected" in expanded.detail
     assert "⏳ Organization policy: Pending" in expanded.detail
     assert ("confirm" in interaction["actions"]) is allowed

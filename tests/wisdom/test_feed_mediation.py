@@ -139,20 +139,21 @@ def test_qualified_candidate_uses_professionalism_not_installation_assessor(
     assert groups == [items]
     view = advice_view(groups[0])
     assert [a.label for a in view.items[0].actions] == [
-        "Show checks",
-        "Not Now",
-        "Review first",
-        "Share",
+        "Review Checks",
+        "View More Details",
+        "Snooze Collective Wisdom",
+        "Maybe Later",
+        "Share My Skill",
     ]
     assert view.items[0].actions[-1].primary
     assert "consistently across many days" in view.to_text()
     assert (
-        "Safe to share at work" if review_status == "pass"
+        "Safe for work" if review_status == "pass"
         else "Needs a look before sharing at work" if review_status == "advisory"
         else review_status.capitalize()
     ) in view.to_text()
     assert "Hermes recommendation:" not in view.to_text()
-    assert "✅ Security check (local preflight)" in view.to_text()
+    assert "✅ No security issues detected" in view.to_text()
     assert "will be scanned" not in view.to_text()
     instance.service.candidate_security_check.assert_called_once_with(
         skill_id="local", content_hash="hash"

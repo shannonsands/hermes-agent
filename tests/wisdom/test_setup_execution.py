@@ -616,7 +616,7 @@ def test_native_install_hands_off_owned_setup_without_implicit_execution(setup, 
         assert not model_calls and not marker.exists()
         reopened = resolve_surface_action(service, f"wi:agent:setup.status:{install['id']}",
                                           platform=actor.platform, actor_id=actor.actor_id, chat_id=actor.chat_id)
-        assert any(action.callback_data == f"wi:agent:confirm:{prerequisite['id']}" for action in reopened.actions)
+        assert not any(action.callback_data == f"wi:agent:confirm:{prerequisite['id']}" for action in reopened.actions)
         assert not model_calls and not marker.exists()
         now[0] += 86401
         expired = consent.resolve("org-1", install["id"], actor, "setup.status")

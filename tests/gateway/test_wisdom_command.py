@@ -869,10 +869,9 @@ def test_plan_checks_preserve_exact_approval_and_navigation(route):
         view = controller.execute_token(action.callback_data.removeprefix("wi:cmd:"), service, context)
 
     service.version_detail.assert_called_once_with("skill-1", 2, include_compatibility=False)
-    assert "✅ Security check" in view.summary
-    assert "No issues detected" in view.summary
+    assert "✅ No security issues detected" in view.summary
     assert "Unavailable" in view.summary  # Advisory absence is not a security pass.
-    assert "Private keys" not in view.summary
+    assert "✅ No private keys detected" in view.summary
     original_history = view._navigation_history
     bind_view_callbacks(view, context)
     original_receipt = next(a.arguments["receipt"] for a in view.actions if a.operation == f"{kind}_apply")
@@ -884,7 +883,8 @@ def test_plan_checks_preserve_exact_approval_and_navigation(route):
         with pytest.raises(PermissionError):
             controller.execute_token(token, service, _context(user_id="other"))
         view = controller.execute_token(token, service, context)
-        assert ("Private keys" in view.summary) is expanded
+        assert "✅ No private keys detected" in view.summary
+        assert ("security certification" in view.summary) is expanded
         assert "✅ Pass" not in view.summary
         assert view._navigation_history == original_history
         bind_view_callbacks(view, context)

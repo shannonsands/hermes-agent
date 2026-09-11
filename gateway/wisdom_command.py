@@ -92,6 +92,7 @@ class WisdomItem:
     title: str
     detail: str = ""
     actions: list[WisdomAction] = field(default_factory=list)
+    preamble: str = ""
 
 
 @dataclass
@@ -102,6 +103,7 @@ class WisdomView:
     actions: list[WisdomAction] = field(default_factory=list)
     notice: str | None = None
     navigation_actions: list[WisdomAction] = field(default_factory=list)
+    _dismissed: bool = field(default=False, repr=False)
     _navigation_target: _NavigationTarget | None = field(default=None, repr=False)
     _navigation_history: tuple[_NavigationTarget, ...] = field(
         default_factory=tuple, repr=False
@@ -112,6 +114,8 @@ class WisdomView:
         if self.summary:
             lines.extend(("", self.summary))
         for item in self.items:
+            if item.preamble:
+                lines.extend(("", item.preamble))
             lines.extend(("", item.title))
             if item.detail:
                 lines.append(item.detail)
@@ -138,6 +142,8 @@ class WisdomView:
         if self.summary:
             lines.extend(("", self.summary))
         for item in self.items:
+            if item.preamble:
+                lines.extend(("", item.preamble))
             lines.extend(("", item.title))
             if item.detail:
                 lines.append(item.detail)

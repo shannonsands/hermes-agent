@@ -25,9 +25,10 @@ def process_share_package(mediation, org: str, job: dict, *, runtime) -> dict:
                 WHERE id=? AND organization_id=? AND state='fallback'
                 AND lease_token=? AND lease_until>?""",
                 (
-                    json.dumps({"kind": "notice", "user_requested": True}),
+                    json.dumps({"kind": "notice", "user_requested": True,
+                                "notice_kind": "share_packaging_failed"}),
                     json.dumps({
-                        "title": "Share preparation needs attention",
+                        "title": "Share Packaging failed",
                         "relevance": "recommend",
                         "explanation": "Hermes could not prepare this package. Nothing was uploaded or published. Use /wisdom candidates to review it manually.",
                     }),
@@ -120,7 +121,7 @@ def process_share_package(mediation, org: str, job: dict, *, runtime) -> dict:
         advice = {
             "title": package.editorial_name,
             "relevance": "recommend",
-            "explanation": "Your proposed team package is ready to review. Nothing has been uploaded or published. Review its files and portability notes before approving sharing.",
+            "explanation": "Would you like to share it?",
         }
         db.execute(
             "UPDATE wisdom_assessment SET reference_json=?,advice_json=?,state='ready',updated_at=? WHERE id=?",

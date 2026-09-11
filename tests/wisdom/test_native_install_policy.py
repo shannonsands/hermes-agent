@@ -82,7 +82,7 @@ def test_native_install_preserves_selected_policy_through_recheck_and_apply(nati
         view = advice_view([{"interaction": shown, "advice": {
             "title": "Selected skill", "explanation": "Review this skill.", "relevance": "recommend",
         }}], checks_expanded=expanded)
-        assert policy_line in view.to_text()
+        assert (policy_line in view.to_text()) is expanded
     assert service.store.installation("skill-1") is None
     assert service.client.records == []
     # A new controller reads the same SQLite review rather than transport memory.

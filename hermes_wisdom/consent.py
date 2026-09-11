@@ -586,6 +586,8 @@ class WisdomConsent:
         result = self._resolve(
             org, interaction_id, actor, "inspect" if page else action
         )
+        if result.get("deferred"):
+            return result
         if result["operation"] == "setup" and result["state"] in {"applying", "needs_review"}:
             with self.service.store.transaction() as db:
                 self.queue._check_org(db, org)
@@ -657,7 +659,7 @@ class WisdomConsent:
 
     def _review_in_portal(self, org, interaction_id, actor):
         result = self._resolve(org, interaction_id, actor, "inspect")
-        if result["operation"] not in {"share", "publish"} or result["state"] != "pending":
+        if result.get("deferred") or result["operation"] not in {"share", "publish"} or result["state"] != "pending":
             return result
         entity = "portal-review:" + interaction_id
         token = self.service.store.acquire_operation_lock(entity, ttl_seconds=300)
@@ -668,7 +670,7 @@ class WisdomConsent:
         try:
             def guard():
                 current = self._resolve(org, interaction_id, actor, "inspect")
-                if current["state"] != "pending" or current["expires_at"] <= self.queue.clock():
+                if current.get("deferred") or current["state"] != "pending" or current["expires_at"] <= self.queue.clock():
                     raise WisdomConflict("this review control is no longer current")
                 with self.service.store.transaction() as db:
                     lease = db.execute(
@@ -818,6 +820,12 @@ class WisdomConsent:
                 and value["plan"]["origin_address"] != actor.address
             ):
                 raise WisdomNotFound("Wisdom interaction not found")
+            deferred = db.execute(
+                "SELECT 1 FROM wisdom_consent_defer WHERE interaction_id=? AND surface=?",
+                (interaction_id, actor.platform),
+            ).fetchone()
+            if deferred:
+                return {**self.project(value), "deferred": True, "actions": []}
             if action == "inspect" or value["state"] in TERMINAL:
                 return self.project(value)
             if action == "defer":

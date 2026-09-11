@@ -58,8 +58,8 @@ def test_pending_then_published_updates_one_receipt_without_repeated_edits(cards
     draft.state = "published"
     (published,) = updater.claim("telegram")
     assert published["id"] == identity and published["receipt"] == job["receipt"]
-    assert published["view"].summary == "Published"
-    assert published["view"].actions[0].label == "View in Portal"
+    assert published["view"].summary == "Shared!"
+    assert published["view"].actions[0].label == "View details"
     updater.finish(published, success=True)
     assert updater.claim("telegram") == []
     assert has_card(updater.store, "org", "draft")
@@ -182,9 +182,9 @@ def test_portal_publication_retires_original_consent_controls(cards, state):
         db.execute("UPDATE wisdom_consent SET state=? WHERE id=?", (state, identity))
     draft.state = "published"
     (job,) = updater.claim("telegram")
-    assert job["view"].summary == "Published"
+    assert job["view"].summary == "Shared!"
     assert job["receipt"]["message_id"] == "1"
-    assert [a.label for a in job["view"].actions] == ["View in Portal"]
+    assert [a.label for a in job["view"].actions] == ["View details"]
     with updater.store.transaction() as db:
         assert (
             db.execute(
@@ -227,7 +227,7 @@ def test_portal_revision_chain_tracks_moderation_then_publication(cards):
     latest.state = "published"
     (published,) = updater.claim("telegram")
     assert published["receipt"] == job["receipt"]
-    assert published["view"].summary == "Published"
+    assert published["view"].summary == "Shared!"
     updater.finish(published, success=True)
     assert updater.claim("telegram") == []
     assert has_card(updater.store, "org", "latest")

@@ -82,17 +82,27 @@ class TelegramWisdomMixin:
             return
 
         if data.startswith("wi:agent:"):
-            await query.answer(text="Checking current state")
+            await query.answer(text="" if data.startswith("wi:agent:defer:") else "Gathering the necessary details")
             try:
                 def resolve():
                     from hermes_wisdom.mediation_view import resolve_surface_action
                     from hermes_wisdom.service import WisdomService
 
-                    return resolve_surface_action(
-                        WisdomService(), data, platform="telegram", actor_id=caller_id,
+                    service = WisdomService()
+                    context = surface_context(self,
+                        user_id=caller_id, chat_id=str(query_chat_id or ""),
+                        profile=getattr(self, "_owner_profile", None),
+                        organization_id=service.store.active_org_id(),
+                        is_group=str(query_chat_type or "").lower() in {"group", "supergroup", "channel", "forum"},
+                        thread_id=str(query_thread_id or ""),
+                    )
+                    view = resolve_surface_action(
+                        service, data, platform="telegram", actor_id=caller_id,
                         chat_id=str(query_chat_id or ""), thread_id=str(query_thread_id or ""),
                     )
-                view = await self._run_wisdom_profile_operation(resolve)
+                    return view, context
+                view, context = await self._run_wisdom_profile_operation(resolve)
+                await self._prepare_wisdom_command_view(view, context)
                 await self._edit_wisdom_command_view(query, view, full_details=True)
             except Exception:
                 await query.answer(text="This control is unavailable. Open /wisdom inbox to review current state.", show_alert=True)
@@ -101,7 +111,7 @@ class TelegramWisdomMixin:
         if data.startswith("wi:cmd:"):
             token = data.removeprefix("wi:cmd:")
             try:
-                await query.answer(text="Checking current state…")
+                await query.answer(text="Gathering the necessary details…")
 
                 def command_action():
                     from gateway.wisdom_command import (
@@ -270,7 +280,7 @@ class TelegramWisdomMixin:
                 actions=actions,
             )
             return
-        await query.answer(text="Checking current state...")
+        await query.answer(text="Gathering the necessary details...")
         try:
             def review():
                 from hermes_wisdom.agent_led.actions import current_install_view
@@ -347,17 +357,17 @@ class TelegramWisdomMixin:
             controls = [value for action in actions if (value := button(action))]
             if not controls:
                 return ""
-            return (
-                '<tg-button-row align="left">'
-                f"{' '.join(controls)}"
-                "</tg-button-row>"
+            return "".join(
+                '<tg-button-row align="left">' + " ".join(controls[i:i + 2]) + "</tg-button-row>"
+                for i in range(0, len(controls), 2)
             )
 
         item_html: list[str] = []
         for item in view.items[:5]:
+            preamble = f"<p>{_html.escape(compact(item.preamble, 600))}</p>" if item.preamble else ""
             candidate = (
-                f"<p><b>{_html.escape(compact(item.title, 140))}</b>"
-                f"<br/>{_html.escape(item.detail if full_details else compact(item.detail, 300)).replace(chr(10), '<br/>')}"
+                preamble + f"<p><b>{_html.escape(compact(item.title, 140))}</b>"
+                f"<br/>{_html.escape(item.detail if full_details else compact(item.detail, 300)).replace(chr(10) + '  ', '<br/>&nbsp;&nbsp;').replace(chr(10), '<br/>')}"
                 "</p>"
                 f"{button_row(item.actions)}"
             )
@@ -503,6 +513,10 @@ class TelegramWisdomMixin:
 
         message = getattr(query, "message", None)
         raw_request = getattr(getattr(self, "_bot", None), "do_api_request", None)
+        if view._dismissed:
+            from .wisdom_dismiss import dismiss_original
+            if await dismiss_original(self, query):
+                return
         if message is not None and callable(raw_request):
             try:
                 await raw_request(

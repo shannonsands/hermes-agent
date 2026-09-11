@@ -161,7 +161,7 @@ def test_review_text_pass_is_a_single_line_without_the_word_pass():
         include_checks=True,
     )
 
-    assert text == "Safe to share at work \u2713 (no inappropriate content found)"
+    assert text == "✅ Safe for work (no inappropriate content detected)"
     assert "Pass" not in text
     assert "Profanity" not in text
 
